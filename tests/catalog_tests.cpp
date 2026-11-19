@@ -66,6 +66,8 @@ void testEnumerationAndInput(const fs::path& root) {
     require(!scanDirectory(asWide(audio / "readme.txt"), metadata).error.empty(), "File path should not be a directory");
     require(!scanDirectory(L"", metadata).error.empty(), "Empty input should report an error");
     require(isAudioFile(L"audio.WAVE") && !isAudioFile(L"audio.wav.exe"), "Extension filter is incorrect");
+    require(isAudioFile(L"audio.AIF") && isAudioFile(L"audio.AIFF") && isAudioFile(L"audio.AIFC"),
+            "AIFF extension filter is incomplete");
 #ifdef _WIN32
     _wputenv_s(L"ABSER_TEST_DIRECTORY", asWide(audio).c_str());
 #else
@@ -175,6 +177,17 @@ void testSortingAndFiltering() {
             "All/none filtering failed");
     require(naturalCompare(L"take99999999999999999999999", L"take100000000000000000000000") < 0,
             "Natural sorting overflowed a long number");
+    require(naturalCompare(L"take99999999999999999999998", L"take99999999999999999999999") < 0,
+            "Equal-length long numeric IDs were compared incorrectly");
+    require(naturalCompare(L"take00000000000000000000002b2", L"TAKE2b3") < 0 &&
+            naturalCompare(L"TAKE02", L"take2") == 0,
+            "Leading zeroes or case-insensitive natural sorting failed");
+    require(naturalCompare(L"take!2", L"take1") < 0 && naturalCompare(L"take_2", L"take1") > 0,
+            "Punctuation adjacent to numeric runs sorted incorrectly");
+#ifdef _WIN32
+    require(naturalCompare(L"ÄÄNI2", L"ääni10") < 0 && naturalCompare(L"ÄÄNI", L"ääni") == 0,
+            "Windows Unicode case-insensitive text comparison failed");
+#endif
 }
 } // namespace
 

@@ -127,11 +127,22 @@ void key(HWND window, UINT code) {
 }
 
 void openByEnter(Process& process, HWND path, HWND list, const std::filesystem::path& folder, int expectedCount) {
-    require(SetWindowTextW(path, folder.c_str()) != FALSE, "Could not set address field");
+    require(SendMessageW(path, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(folder.c_str())) != FALSE, "Could not set address field");
+    wchar_t entered[32768]{};
+    SendMessageW(path, WM_GETTEXT, 32768, reinterpret_cast<LPARAM>(entered));
+    require(folder.wstring() == entered, "Address field did not retain the entered path");
     focusControl(process.window, path); key(path, VK_RETURN);
-    waitFor([&] { require(process.alive(), "App exited while changing folders");
-                  return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == expectedCount; },
-            "Address Enter did not load expected folder");
+    try {
+        waitFor([&] { require(process.alive(), "App exited while changing folders");
+                      return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == expectedCount; },
+                "Address Enter did not load expected folder");
+    } catch (...) {
+        wchar_t actual[32768]{};
+        SendMessageW(path, WM_GETTEXT, 32768, reinterpret_cast<LPARAM>(actual));
+        std::wcerr << L"Expected folder: " << folder.wstring() << L"; address text: " << actual
+                   << L"; list count: " << SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) << L'\n';
+        throw;
+    }
     const DWORD thread = GetWindowThreadProcessId(process.window, nullptr);
     waitFor([&] { GUITHREADINFO state{sizeof(state)}; return GetGUIThreadInfo(thread, &state) && state.hwndFocus == list; },
             "Opening a folder did not return focus to file list");
@@ -191,6 +202,27 @@ int run(const std::filesystem::path& executable) {
     SendMessageW(unassigned, BM_CLICK, 0, 0);
     waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; }, "Unassigned filter did not restore files");
 
+    // Assign Red through the actual native context menu and its modal key loop.
+    focusControl(process.window, list); key(list, VK_DOWN);
+    waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) >= 0; }, "Could not select a file for categorization");
+    const DWORD uiThread = GetWindowThreadProcessId(process.window, nullptr);
+    auto menuActive = [&] { GUITHREADINFO state{sizeof(state)};
+        return GetGUIThreadInfo(uiThread, &state) && (state.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)); };
+    require(PostMessageW(list, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), MAKELPARAM(-1, -1)) != FALSE,
+            "Could not open category context menu");
+    waitFor(menuActive, "Category context menu did not open", 2000);
+    key(list, VK_HOME); key(list, VK_DOWN); key(list, VK_RETURN);
+    waitFor([&] { require(process.alive(), "App exited choosing a category"); return !menuActive(); },
+            "Category context menu did not accept keyboard selection", 2000);
+    SendMessageW(unassigned, BM_CLICK, 0, 0);
+    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 1; },
+            "Red assignment was not applied by the native menu");
+    RedrawWindow(process.window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    captureWindow(process.window, L"ui-smoke-category.bmp");
+    SendMessageW(unassigned, BM_CLICK, 0, 0);
+    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; },
+            "Assigned and unassigned files did not restore together");
+
     // Exercise native header clicks and resizable columns on the shipped control.
     const int catWidth = static_cast<int>(SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0));
     const int x = catWidth + 15;
@@ -216,9 +248,10 @@ int run(const std::filesystem::path& executable) {
     require(saved.find("S folder ") != std::string::npos, "Last folder was not remembered");
     require(saved.find("S col1 ") != std::string::npos, "Column width was not remembered");
     require(saved.find("S ascending 0") != std::string::npos, "Header click did not reverse the filename sort");
+    require(saved.find("C 1 ") != std::string::npos, "Red file category was not persisted");
     for (const auto& file : std::filesystem::directory_iterator(audio))
         require(file.path().extension() == L".wav", "App wrote metadata into the audio folder");
-    std::cout << "UI smoke passed: Unicode paths, Enter, selection, empty folder, filters, sorting, resizing, persistence, clean exit.\n";
+    std::cout << "UI smoke passed: Unicode paths, Enter, selection, empty folder, filters, category menu, sorting, resizing, persistence, clean exit.\n";
     return 0;
 }
 } // namespace

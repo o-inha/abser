@@ -83,7 +83,7 @@ struct App {
     HWND window{}, path{}, open{}, list{}, volume{}, play{}, tooltip{}, filters[11]{};
     HFONT font{}, smallFont{}; HBRUSH bgBrush{}, panelBrush{}; HIMAGELIST rowImages{};
     UINT dpi = 96; MetadataStore store; AudioEngine audio; std::unique_ptr<FolderWorker> worker;
-    std::thread audioInit; bool audioReady = false, audioStarting = true, smokeTest = false; std::wstring queuedPlay;
+    std::thread audioInit; bool audioReady = false, audioStarting = true, smokeTest = false, queuedPaused = false; std::wstring queuedPlay;
     std::vector<FileEntry> files; std::vector<size_t> visible;
     std::unordered_map<std::wstring,size_t> fileIndex;
     uint64_t generation = 0; bool suppressSelection = false, ready = false, loading = false, closing = false;
@@ -123,7 +123,7 @@ struct App {
     }
     void playRow(int row) {
         if (auto e=entry(row)) { notice.clear(); selectionChanged=std::chrono::steady_clock::now();
-            if(audioStarting) {queuedPlay=e->path;playback={e->path,L"",AudioState::Loading,-1.0,0.0};} else audio.play(e->path);
+            if(audioStarting) {queuedPlay=e->path;queuedPaused=false;playback={e->path,L"",AudioState::Loading,-1.0,0.0};} else audio.play(e->path);
             InvalidateRect(window,nullptr,FALSE); }
     }
     void navigate(int step) {
@@ -131,11 +131,15 @@ struct App {
         ListView_SetItemState(list,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED); ListView_EnsureVisible(list,row,FALSE);
         SetFocus(list);
     }
-    void togglePlay() { if(playback.state==AudioState::Stopped || playback.state==AudioState::Error || playback.state==AudioState::Finished) { int row=selected(); if(row<0 && !visible.empty()) { navigate(1); return; } playRow(row); } else audio.togglePause(); }
+    void togglePlay() {
+        if(audioStarting&&!queuedPlay.empty()) {queuedPaused=!queuedPaused;playback.state=queuedPaused?AudioState::Paused:AudioState::Loading;InvalidateRect(window,nullptr,FALSE);return;}
+        if(!audioStarting)playback=audio.snapshot();
+        if(playback.state==AudioState::Stopped || playback.state==AudioState::Error || playback.state==AudioState::Finished) { int row=selected(); if(row<0 && !visible.empty()) { navigate(1); return; } playRow(row); } else audio.togglePause();
+    }
     void load(const std::wstring& input) {
         if(input.empty()) return; notice.clear(); loading=true; savedSelection.clear();
         if(auto e=entry(selected())) savedSelection=e->path;
-        queuedPlay.clear();audio.stop(); generation=worker->request(input,store); InvalidateRect(window,nullptr,FALSE);
+        queuedPlay.clear();queuedPaused=false;audio.stop(); generation=worker->request(input,store); InvalidateRect(window,nullptr,FALSE);
     }
     void browse() {
         IFileOpenDialog* dialog=nullptr;
@@ -193,6 +197,11 @@ LRESULT CALLBACK PathProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
     return DefSubclassProc(hwnd,message,wParam,lParam);
 }
 LRESULT CALLBACK ListProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_NOTIFY) {
+        auto header=reinterpret_cast<NMHDR*>(lParam);
+        if(header->hwndFrom==ListView_GetHeader(hwnd)&&(header->code==NM_CUSTOMDRAW||header->code==HDN_ENDTRACKW||header->code==HDN_ENDTRACKA))
+            return SendMessageW(app->window,WM_NOTIFY,wParam,lParam);
+    }
     if(message==WM_LBUTTONDOWN) {
         LVHITTESTINFO hit{}; hit.pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)}; ListView_SubItemHitTest(hwnd,&hit);
         if(hit.iItem>=0 && hit.iSubItem==0) { POINT point=hit.pt; ClientToScreen(hwnd,&point); app->assignCategory(hit.iItem,point); return 0; }
@@ -334,12 +343,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
                 auto cd=reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
                 if(cd->nmcd.dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW|CDRF_NOTIFYPOSTPAINT;
                 if(cd->nmcd.dwDrawStage==CDDS_POSTPAINT) {if(a->visible.empty()){RECT r{};GetClientRect(a->list,&r);r.top=a->scale(62);r.left=a->scale(12);r.right-=a->scale(12);std::wstring msg=a->loading?L"Opening folder\u2026":a->folder.empty()?L"Open an audio folder\n\nPaste a path above and press Enter,\nor click the folder button.":a->files.empty()?L"No audio files in this folder":L"No files match the selected colours";SelectObject(cd->nmcd.hdc,a->font);textDraw(cd->nmcd.hdc,msg,r,MUTED,DT_CENTER|DT_TOP|DT_WORDBREAK);}return CDRF_DODEFAULT;}
-                if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT) {cd->clrText=TEXT;cd->clrTextBk=(cd->nmcd.uItemState&CDIS_SELECTED)?SELECTED:PANEL;return CDRF_NOTIFYSUBITEMDRAW;}
+                if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT) {return CDRF_NOTIFYSUBITEMDRAW;}
                 if(cd->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)) {const auto* e=a->entry(static_cast<int>(cd->nmcd.dwItemSpec));if(!e)return CDRF_DODEFAULT;
                     RECT r{};ListView_GetSubItemRect(a->list,static_cast<int>(cd->nmcd.dwItemSpec),cd->iSubItem,LVIR_BOUNDS,&r);
-                    if(cd->iSubItem==0) {r.right=r.left+ListView_GetColumnWidth(a->list,0);fill(cd->nmcd.hdc,r,(cd->nmcd.uItemState&CDIS_SELECTED)?SELECTED:PANEL);
+                    const bool selected=(ListView_GetItemState(a->list,static_cast<int>(cd->nmcd.dwItemSpec),LVIS_SELECTED)&LVIS_SELECTED)!=0;
+                    if(cd->iSubItem==0) {r.right=r.left+ListView_GetColumnWidth(a->list,0);fill(cd->nmcd.hdc,r,selected?SELECTED:PANEL);
                         int size=a->scale(11);RECT s{r.left+(r.right-r.left-size)/2,r.top+(r.bottom-r.top-size)/2,0,0};s.right=s.left+size;s.bottom=s.top+size;swatch(cd->nmcd.hdc,s,e->category);return CDRF_SKIPDEFAULT;}
-                    cd->clrText=cd->iSubItem==1?TEXT:MUTED;cd->clrTextBk=(cd->nmcd.uItemState&CDIS_SELECTED)?SELECTED:PANEL;return CDRF_DODEFAULT;
+                    fill(cd->nmcd.hdc,r,selected?SELECTED:PANEL);r.left+=a->scale(7);r.right-=a->scale(7);SelectObject(cd->nmcd.hdc,a->font);
+                    std::wstring value=cd->iSubItem==1?e->name:cd->iSubItem==2?durationText(e->duration):modifiedText(e->modified);
+                    textDraw(cd->nmcd.hdc,value,r,cd->iSubItem==1?TEXT:MUTED,(cd->iSubItem==2?DT_RIGHT:DT_LEFT)|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+                    return CDRF_SKIPDEFAULT;
                 }
                 return CDRF_DODEFAULT;
             }
@@ -349,7 +362,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
         }
         if(hdr->hwndFrom==ListView_GetHeader(a->list)) {
             if(hdr->code==HDN_ENDTRACKW||hdr->code==HDN_ENDTRACKA){a->dirty();return 0;}
-            if(hdr->code==NM_CUSTOMDRAW) {auto cd=reinterpret_cast<NMCUSTOMDRAW*>(lParam);if(cd->dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
+            if(hdr->code==NM_CUSTOMDRAW) {auto cd=reinterpret_cast<NMCUSTOMDRAW*>(lParam);if(cd->dwDrawStage==CDDS_PREPAINT){RECT r{};GetClientRect(hdr->hwndFrom,&r);fill(cd->hdc,r,BG);return CDRF_NOTIFYITEMDRAW;}
                 if(cd->dwDrawStage==CDDS_ITEMPREPAINT){RECT r=cd->rc;fill(cd->hdc,r,BG);SelectObject(cd->hdc,a->smallFont);int i=static_cast<int>(cd->dwItemSpec);wchar_t label[64]{};HDITEMW item{};item.mask=HDI_TEXT;item.pszText=label;item.cchTextMax=64;Header_GetItem(hdr->hwndFrom,i,&item);
                     r.left+=a->scale(8);r.right-=a->scale(5);std::wstring text=label;if(i==static_cast<int>(a->store.settings.sortColumn))text+=a->store.settings.ascending?L" \u2191":L" \u2193";textDraw(cd->hdc,text,r,MUTED);line(cd->hdc,cd->rc.right-1,cd->rc.top+a->scale(7),cd->rc.right-1,cd->rc.bottom-a->scale(7),LINE);return CDRF_SKIPDEFAULT;}}
         }
@@ -363,6 +376,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: SetTextColor(reinterpret_cast<HDC>(wParam),TEXT);SetBkColor(reinterpret_cast<HDC>(wParam),BG);return reinterpret_cast<LRESULT>(a->bgBrush);
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);paint(*a,dc);EndPaint(hwnd,&ps);return 0;}
+    case WM_PRINTCLIENT: paint(*a,reinterpret_cast<HDC>(wParam));return 0;
     case WM_SCAN: {
         std::unique_ptr<ScanMessage> result(reinterpret_cast<ScanMessage*>(lParam));if(result->generation!=a->generation)return 0;a->loading=false;
         if(!result->result.error.empty()) {a->notice=result->result.error;InvalidateRect(hwnd,nullptr,FALSE);InvalidateRect(a->list,nullptr,FALSE);return 0;}
@@ -382,7 +396,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
     case WM_AUDIO: a->updateAudio();return 0;
     case WM_AUDIO_READY:
         if(a->audioInit.joinable())a->audioInit.join();a->audioStarting=false;a->audioReady=wParam!=0;
-        if(a->audioReady&&!a->queuedPlay.empty())a->audio.play(a->queuedPlay);a->queuedPlay.clear();a->updateAudio();return 0;
+        if(a->audioReady&&!a->queuedPlay.empty()) {a->audio.play(a->queuedPlay);if(a->queuedPaused)a->audio.togglePause();}
+        a->queuedPlay.clear();a->queuedPaused=false;a->updateAudio();return 0;
     case WM_TIMER: if(wParam==TIMER_SAVE){KillTimer(hwnd,TIMER_SAVE);a->save();}else if(wParam==TIMER_UI){a->updateAudio();if(a->durationSortDirty){a->durationSortDirty=false;a->rebuild();}}return 0;
     case WM_DROPFILES: {HDROP drop=reinterpret_cast<HDROP>(wParam);wchar_t path[32768];if(DragQueryFileW(drop,0,path,32768)){std::filesystem::path value(path);std::error_code ec;if(!std::filesystem::is_directory(value,ec))value=value.parent_path();SetWindowTextW(a->path,value.c_str());a->load(value.wstring());}DragFinish(drop);return 0;}
     case WM_CLOSE: a->closing=true;a->save();DestroyWindow(hwnd);return 0;
@@ -429,7 +444,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
                 if(msg.wParam==VK_SPACE&&(focus==application.list||focus==window||focus==application.play||focus==application.volume)){application.togglePlay();continue;}
                 if(focus==application.list&&(msg.wParam==VK_UP||msg.wParam==VK_DOWN)){application.navigate(msg.wParam==VK_UP?-1:1);continue;}
                 if(focus==application.list&&msg.wParam=='C'&&!ctrl){application.categoryForSelection();continue;}
-                if(focus==application.list&&msg.wParam==VK_ESCAPE){application.audio.stop();continue;}
+                if(focus==application.list&&msg.wParam==VK_ESCAPE){application.queuedPlay.clear();application.queuedPaused=false;application.audio.stop();continue;}
             }
         }
         if(!IsDialogMessageW(window,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}

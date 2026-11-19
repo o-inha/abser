@@ -22,7 +22,6 @@
 #endif
 #include <windows.h>
 #include <shlobj.h>
-#include <shlwapi.h>
 #endif
 
 namespace abser {
@@ -349,7 +348,8 @@ bool isAudioFile(const std::wstring& filename) {
     if (dot == std::wstring::npos) return false;
     const auto ext = lowercase(filename.substr(dot));
     return ext == L".wav" || ext == L".wave" || ext == L".mp3" ||
-           ext == L".flac" || ext == L".ogg";
+           ext == L".flac" || ext == L".ogg" || ext == L".aif" ||
+           ext == L".aiff" || ext == L".aifc";
 }
 
 ScanResult scanDirectory(const std::wstring& input, const MetadataStore& metadata) {
@@ -431,16 +431,15 @@ ScanResult scanDirectory(const std::wstring& input, const MetadataStore& metadat
 }
 
 int naturalCompare(const std::wstring& left, const std::wstring& right) {
-#ifdef _WIN32
-    const int result = StrCmpLogicalW(left.c_str(), right.c_str());
-    return (result > 0) - (result < 0);
-#else
+    // Compare numeric runs as decimal strings rather than converting them to a
+    // fixed-width integer. Sample filenames can contain arbitrarily long IDs.
+    const auto digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
     size_t i = 0, j = 0;
     while (i < left.size() && j < right.size()) {
-        if (left[i] >= L'0' && left[i] <= L'9' && right[j] >= L'0' && right[j] <= L'9') {
+        if (digit(left[i]) && digit(right[j])) {
             size_t endLeft = i, endRight = j;
-            while (endLeft < left.size() && left[endLeft] >= L'0' && left[endLeft] <= L'9') ++endLeft;
-            while (endRight < right.size() && right[endRight] >= L'0' && right[endRight] <= L'9') ++endRight;
+            while (endLeft < left.size() && digit(left[endLeft])) ++endLeft;
+            while (endRight < right.size() && digit(right[endRight])) ++endRight;
             size_t digitsLeft = i, digitsRight = j;
             while (digitsLeft + 1 < endLeft && left[digitsLeft] == L'0') ++digitsLeft;
             while (digitsRight + 1 < endRight && right[digitsRight] == L'0') ++digitsRight;
@@ -450,14 +449,27 @@ int naturalCompare(const std::wstring& left, const std::wstring& right) {
             if (numeric) return numeric < 0 ? -1 : 1;
             i = endLeft; j = endRight;
         } else {
+#ifdef _WIN32
+            // Keep Windows' Unicode case-insensitive text comparison, while
+            // handling numbers ourselves so very long numeric runs cannot wrap.
+            size_t length = 0;
+            while (i + length < left.size() && j + length < right.size() &&
+                   !digit(left[i + length]) && !digit(right[j + length])) ++length;
+            if (length == 0) length = 1; // Only one side starts with a digit.
+            const int compare = CompareStringOrdinal(left.data() + i, static_cast<int>(length),
+                right.data() + j, static_cast<int>(length), TRUE);
+            if (compare == CSTR_LESS_THAN) return -1;
+            if (compare == CSTR_GREATER_THAN) return 1;
+            i += length; j += length;
+#else
             const wchar_t a = static_cast<wchar_t>(std::towlower(left[i++]));
             const wchar_t b = static_cast<wchar_t>(std::towlower(right[j++]));
             if (a != b) return a < b ? -1 : 1;
+#endif
         }
     }
     if (i == left.size() && j == right.size()) return 0;
     return i == left.size() ? -1 : 1;
-#endif
 }
 
 void sortFiles(std::vector<FileEntry>& files, SortColumn column, bool ascending) {
