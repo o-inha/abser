@@ -82,7 +82,7 @@ BOOL CALLBACK findWindow(HWND window, LPARAM parameter) {
     DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
     if (pid != process.info.dwProcessId) return TRUE;
     wchar_t name[128]{}; GetClassNameW(window, name, 128);
-    if (std::wstring(name) != kWindowClass) return TRUE;
+    if (std::wstring(name) != kWindowClass || !IsWindowVisible(window)) return TRUE;
     process.window = window; return FALSE;
 }
 
@@ -197,10 +197,20 @@ int run(const std::filesystem::path& executable) {
     STARTUPINFOW startup{sizeof(startup)};
     require(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process.info) != FALSE,
             "Could not launch Abser executable");
+    // A top-level HWND exists before WM_CREATE finishes. Wait for the visible,
+    // fully created window and its children rather than assuming enumeration
+    // means that initialization has completed.
+    WaitForInputIdle(process.info.hProcess, 5000);
     waitFor([&] { require(process.alive(), "Abser exited during startup"); EnumWindows(findWindow, reinterpret_cast<LPARAM>(&process)); return process.window != nullptr; },
-            "Abser did not create its main window");
-    HWND path = GetDlgItem(process.window, kPath), list = GetDlgItem(process.window, kList);
-    require(path && list, "Required native controls are missing");
+            "Abser did not create its visible main window");
+    HWND path = nullptr, list = nullptr;
+    waitFor([&] {
+        require(process.alive(), "Abser exited creating native controls");
+        path = GetDlgItem(process.window, kPath); list = GetDlgItem(process.window, kList);
+        if (!path || !list || !GetDlgItem(process.window, kFilter + 10)) return false;
+        const HWND header = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETHEADER, 0, 0));
+        return header && SendMessageW(header, HDM_GETITEMCOUNT, 0, 0) == 4;
+    }, "Required native controls were not created");
     waitFor([&] { require(process.alive(), "Abser exited loading initial folder"); return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; },
             "Initial folder was not loaded");
     HWND header = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETHEADER, 0, 0));
