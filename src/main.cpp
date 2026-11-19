@@ -196,6 +196,23 @@ LRESULT CALLBACK PathProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
     if(message==WM_KEYDOWN && wParam==VK_ESCAPE) { SetWindowTextW(hwnd,app->folder.c_str()); SetFocus(app->list); return 0; }
     return DefSubclassProc(hwnd,message,wParam,lParam);
 }
+void paintHeader(HWND hwnd,HDC dc) {
+    RECT client{};GetClientRect(hwnd,&client);fill(dc,client,BG);SelectObject(dc,app->smallFont);
+    for(int i=0;i<4;++i) {
+        RECT cell{};if(!Header_GetItemRect(hwnd,i,&cell))continue;
+        wchar_t label[64]{};HDITEMW item{};item.mask=HDI_TEXT;item.pszText=label;item.cchTextMax=64;Header_GetItem(hwnd,i,&item);
+        RECT text=cell;text.left+=app->scale(7);text.right-=app->scale(5);
+        std::wstring value=label;if(i==static_cast<int>(app->store.settings.sortColumn))value+=app->store.settings.ascending?L" \u2191":L" \u2193";
+        textDraw(dc,value,text,MUTED);line(dc,cell.right-1,cell.top+app->scale(5),cell.right-1,cell.bottom-app->scale(5),LINE);
+    }
+    line(dc,0,client.bottom-1,client.right,client.bottom-1,LINE);
+}
+LRESULT CALLBACK HeaderProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);paintHeader(hwnd,dc);EndPaint(hwnd,&ps);return 0;}
+    if(message==WM_PRINTCLIENT){paintHeader(hwnd,reinterpret_cast<HDC>(wParam));return 0;}
+    return DefSubclassProc(hwnd,message,wParam,lParam);
+}
 LRESULT CALLBACK ListProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
     if(message==WM_NOTIFY) {
         auto header=reinterpret_cast<NMHDR*>(lParam);
@@ -289,10 +306,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
         a->path=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PATH)),nullptr,nullptr);
         SendMessageW(a->path,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Folder path")); SetWindowSubclass(a->path,PathProc,1,0);
         a->open=CreateWindowW(L"BUTTON",L"Open folder",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),nullptr,nullptr);
-        a->list=CreateWindowW(WC_LISTVIEWW,L"Audio files",WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LIST)),nullptr,nullptr);
+        a->list=CreateWindowW(WC_LISTVIEWW,L"Audio files",WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LIST)),nullptr,nullptr);
         ListView_SetExtendedListViewStyle(a->list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_INFOTIP);
         ListView_SetBkColor(a->list,PANEL);ListView_SetTextBkColor(a->list,PANEL);ListView_SetTextColor(a->list,TEXT);
-        SetWindowTheme(a->list,L"",L""); SetWindowTheme(ListView_GetHeader(a->list),L"",L""); SetWindowSubclass(a->list,ListProc,1,0);
+        SetWindowTheme(a->list,L"",L""); SetWindowTheme(ListView_GetHeader(a->list),L"",L""); SetWindowSubclass(a->list,ListProc,1,0);SetWindowSubclass(ListView_GetHeader(a->list),HeaderProc,1,0);
         const wchar_t* columns[]{L"Cat",L"Filename",L"Duration",L"Date modified"};
         for(int i=0;i<4;++i) { LVCOLUMNW c{};c.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_FMT;c.pszText=const_cast<LPWSTR>(columns[i]);c.cx=a->scale(a->store.settings.columnWidths[i]);c.fmt=i==2?LVCFMT_RIGHT:LVCFMT_LEFT;ListView_InsertColumn(a->list,i,&c); }
         for(int i=0;i<11;++i) { std::wstring label=L"Show "+std::wstring(COLOR_NAMES[i])+L" category";

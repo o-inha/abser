@@ -86,6 +86,33 @@ BOOL CALLBACK findWindow(HWND window, LPARAM parameter) {
     process.window = window; return FALSE;
 }
 
+struct PopupMenu { DWORD processId; HWND window{}; HMENU menu{}; };
+BOOL CALLBACK findPopupMenu(HWND window, LPARAM parameter) {
+    auto& popup = *reinterpret_cast<PopupMenu*>(parameter);
+    DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+    if (pid != popup.processId || !IsWindowVisible(window)) return TRUE;
+    wchar_t name[64]{}; GetClassNameW(window, name, 64);
+    if (std::wstring(name) != L"#32768") return TRUE;
+    MENUBARINFO info{sizeof(info)};
+    if (!GetMenuBarInfo(window, OBJID_CLIENT, 0, &info) || !info.hMenu) return TRUE;
+    if (GetMenuItemCount(info.hMenu) != 11 || GetMenuItemID(info.hMenu, 1) != 1001) return TRUE;
+    popup.window = window; popup.menu = info.hMenu; return FALSE;
+}
+
+void clickScreen(POINT point) {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN), top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN), height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    require(width > 1 && height > 1, "Native test desktop has invalid dimensions");
+    INPUT input[3]{};
+    for (auto& event : input) event.type = INPUT_MOUSE;
+    input[0].mi.dx = MulDiv(point.x - left, 65535, width - 1);
+    input[0].mi.dy = MulDiv(point.y - top, 65535, height - 1);
+    input[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    input[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    input[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    require(SendInput(3, input, sizeof(INPUT)) == 3, "Could not click the native category menu");
+}
+
 void captureWindow(HWND window, const std::filesystem::path& filename) {
     RECT rect{}; GetWindowRect(window, &rect);
     const int width = rect.right - rect.left, height = rect.bottom - rect.top;
@@ -202,7 +229,7 @@ int run(const std::filesystem::path& executable) {
     SendMessageW(unassigned, BM_CLICK, 0, 0);
     waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; }, "Unassigned filter did not restore files");
 
-    // Assign Red through the actual native context menu and its modal key loop.
+    // Assign Red by clicking the real popup item through the native input route.
     focusControl(process.window, list); key(list, VK_DOWN);
     waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) >= 0; }, "Could not select a file for categorization");
     const DWORD uiThread = GetWindowThreadProcessId(process.window, nullptr);
@@ -211,12 +238,28 @@ int run(const std::filesystem::path& executable) {
     require(PostMessageW(list, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(list), MAKELPARAM(-1, -1)) != FALSE,
             "Could not open category context menu");
     waitFor(menuActive, "Category context menu did not open", 2000);
-    key(list, VK_HOME); key(list, VK_DOWN); key(list, VK_RETURN);
+    PopupMenu popup{process.info.dwProcessId};
+    waitFor([&] { EnumWindows(findPopupMenu, reinterpret_cast<LPARAM>(&popup)); return popup.window != nullptr; },
+            "Could not locate Abser category popup window", 2000);
+    RECT red{};
+    require(GetMenuItemRect(process.window, popup.menu, 1, &red) != FALSE && red.right > red.left && red.bottom > red.top,
+            "Could not locate Red category menu item");
+    captureWindow(popup.window, L"ui-smoke-menu.bmp");
+    const POINT redCenter{(red.left + red.right) / 2, (red.top + red.bottom) / 2};
+    std::cout << "Category menu item1001 at " << redCenter.x << ',' << redCenter.y << '\n';
+    clickScreen(redCenter);
     waitFor([&] { require(process.alive(), "App exited choosing a category"); return !menuActive(); },
-            "Category context menu did not accept keyboard selection", 2000);
+            "Category context menu did not accept a native mouse click", 2000);
     SendMessageW(unassigned, BM_CLICK, 0, 0);
-    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 1; },
-            "Red assignment was not applied by the native menu");
+    try {
+        waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 1; },
+                "Red assignment was not applied by the native menu");
+    } catch (...) {
+        captureWindow(process.window, L"ui-smoke-category-failed.bmp");
+        std::cerr << "After Red click, visible file count=" << SendMessageW(list, LVM_GETITEMCOUNT, 0, 0)
+                  << "; saved metadata=" << readText(metadata) << '\n';
+        throw;
+    }
     RedrawWindow(process.window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     captureWindow(process.window, L"ui-smoke-category.bmp");
     SendMessageW(unassigned, BM_CLICK, 0, 0);
@@ -257,6 +300,7 @@ int run(const std::filesystem::path& executable) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         require(argc == 2, "Usage: abser_ui_smoke.exe <Abser.exe>");
         return run(std::filesystem::absolute(argv[1]));

@@ -24,6 +24,8 @@ Categories and preferences are stored in **%LOCALAPPDATA%\Abser**. Abser does no
 
 Duration metadata is read in the background. Playback streams audio directly and does not wait for waveform generation or loudness analysis. Actual switching latency also depends on the storage device, audio driver, and file format.
 
+MP3 files without duration/seek metadata show a dash for duration, avoiding a full-file scan just to fill that column.
+
 ## Build
 
 Windows with Visual Studio 2022 C++ desktop tools and CMake 3.20 or newer:
