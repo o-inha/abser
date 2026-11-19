@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include <cwctype>
 
 #include <chrono>
 #include <cmath>

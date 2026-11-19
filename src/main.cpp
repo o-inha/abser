@@ -5,7 +5,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -275,20 +277,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
     case WM_CREATE: {
         a->window=hwnd; a->dpi=GetDpiForWindow(hwnd); a->bgBrush=CreateSolidBrush(BG);a->panelBrush=CreateSolidBrush(PANEL);
         BOOL dark=TRUE; DwmSetWindowAttribute(hwnd,20,&dark,sizeof(dark));
-        a->path=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_PATH),nullptr,nullptr);
+        a->path=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PATH)),nullptr,nullptr);
         SendMessageW(a->path,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Folder path")); SetWindowSubclass(a->path,PathProc,1,0);
-        a->open=CreateWindowW(L"BUTTON",L"Open folder",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_OPEN),nullptr,nullptr);
-        a->list=CreateWindowW(WC_LISTVIEWW,L"Audio files",WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_LIST),nullptr,nullptr);
+        a->open=CreateWindowW(L"BUTTON",L"Open folder",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),nullptr,nullptr);
+        a->list=CreateWindowW(WC_LISTVIEWW,L"Audio files",WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LIST)),nullptr,nullptr);
         ListView_SetExtendedListViewStyle(a->list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_INFOTIP);
         ListView_SetBkColor(a->list,PANEL);ListView_SetTextBkColor(a->list,PANEL);ListView_SetTextColor(a->list,TEXT);
         SetWindowTheme(a->list,L"",L""); SetWindowTheme(ListView_GetHeader(a->list),L"",L""); SetWindowSubclass(a->list,ListProc,1,0);
         const wchar_t* columns[]{L"Cat",L"Filename",L"Duration",L"Date modified"};
         for(int i=0;i<4;++i) { LVCOLUMNW c{};c.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_FMT;c.pszText=const_cast<LPWSTR>(columns[i]);c.cx=a->scale(a->store.settings.columnWidths[i]);c.fmt=i==2?LVCFMT_RIGHT:LVCFMT_LEFT;ListView_InsertColumn(a->list,i,&c); }
         for(int i=0;i<11;++i) { std::wstring label=L"Show "+std::wstring(COLOR_NAMES[i])+L" category";
-            a->filters[i]=CreateWindowW(L"BUTTON",label.c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_FILTER+i),nullptr,nullptr);
+            a->filters[i]=CreateWindowW(L"BUTTON",label.c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_FILTER+i)),nullptr,nullptr);
             SendMessageW(a->filters[i],BM_SETCHECK,(a->store.settings.categoryMask&(1u<<i))?BST_CHECKED:BST_UNCHECKED,0); }
-        a->play=CreateWindowW(L"BUTTON",L"Play / pause",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_PLAY),nullptr,nullptr);
-        a->volume=CreateWindowW(TRACKBAR_CLASSW,L"Volume",WS_CHILD|WS_VISIBLE|WS_TABSTOP|TBS_HORZ|TBS_NOTICKS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(ID_VOLUME),nullptr,nullptr);
+        a->play=CreateWindowW(L"BUTTON",L"Play / pause",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PLAY)),nullptr,nullptr);
+        a->volume=CreateWindowW(TRACKBAR_CLASSW,L"Volume",WS_CHILD|WS_VISIBLE|WS_TABSTOP|TBS_HORZ|TBS_NOTICKS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_VOLUME)),nullptr,nullptr);
         SendMessageW(a->volume,TBM_SETRANGE,TRUE,MAKELPARAM(0,100));SendMessageW(a->volume,TBM_SETPOS,TRUE,static_cast<int>(a->store.settings.volume*100));
         SendMessageW(a->volume,TBM_SETPAGESIZE,0,5);SetWindowTheme(a->volume,L"",L"");
         a->tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,nullptr,nullptr);
