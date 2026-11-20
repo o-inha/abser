@@ -1,6 +1,9 @@
 # Abser
 
-A small, portable Windows x64 audio browser. Open a folder and audition its audio files with a click or the arrow keys. Designed for a tall, narrow window beside your main app (DAW, video editor, etc).
+> [!IMPORTANT]  
+> This is a 100% vibe-coded adhoc app prompted over the course of a few minutes. No human has written or reviewed a single line of code.
+
+Extremely small and lightweight, portable Windows x64 audio browser. Open a folder and audition its audio files with a click or the arrow keys. Designed for a tall, narrow window beside your main app (DAW, video editor, etc).
 
 ## Run
 
