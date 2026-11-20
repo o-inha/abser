@@ -171,7 +171,9 @@ struct App {
     void categoryForSelection() { int row=selected(); if(row<0) return; RECT r{}; ListView_GetSubItemRect(list,row,0,LVIR_BOUNDS,&r); POINT p{r.left,r.bottom}; ClientToScreen(list,&p); assignCategory(row,p); }
     void beginDrag(int row) {
         const auto* file=entry(row);if(!file)return;const std::wstring value=file->path;++dragSerial;
+        if(smokeTest) {SetPropW(window,L"Abser.Smoke.DragSerial",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(dragSerial)));SetPropW(window,L"Abser.Smoke.DragActive",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(1)));}
         auto result=dragFile(window,value);
+        if(smokeTest) {SetPropW(window,L"Abser.Smoke.DragResult",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(static_cast<uint32_t>(result.result))));RemovePropW(window,L"Abser.Smoke.DragActive");}
         if(FAILED(result.result)) {notice=L"Could not drag this file.";invalidateTransport();}
         if(((result.effect&DROPEFFECT_MOVE)!=0||result.sourceRemoved)&&!folder.empty())load(folder);
     }
@@ -283,11 +285,21 @@ LRESULT CALLBACK ListProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
         if(header->hwndFrom==ListView_GetHeader(hwnd)&&(header->code==NM_CUSTOMDRAW||header->code==HDN_ENDTRACKW||header->code==HDN_ENDTRACKA))
             return SendMessageW(app->window,WM_NOTIFY,wParam,lParam);
     }
-    if(message==WM_LBUTTONDOWN) {
+    if(message==WM_LBUTTONDOWN||message==WM_LBUTTONDBLCLK) {
         LVHITTESTINFO hit{}; hit.pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)}; ListView_SubItemHitTest(hwnd,&hit);
         if(hit.iItem>=0 && hit.iSubItem==0) { POINT point=hit.pt; ClientToScreen(hwnd,&point); app->assignCategory(hit.iItem,point); return 0; }
-        bool same=hit.iItem>=0 && app->selected()==hit.iItem;const auto serial=app->dragSerial;LRESULT result=DefSubclassProc(hwnd,message,wParam,lParam);
-        if(same&&serial==app->dragSerial) app->playRow(hit.iItem); return result;
+        if(hit.iItem>=0) {
+            const int row=hit.iItem;const auto* file=app->entry(row);const std::wstring selectedPath=file?file->path:L"";
+            const bool same=app->selected()==row;SetFocus(hwnd);
+            ListView_SetItemState(hwnd,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+            if(same)app->playRow(row);UpdateWindow(hwnd);
+            // Explicitly detect drags in every text column, including a second
+            // rapid click. Native report views do not handle all these cases.
+            if(DragDetect(hwnd,hit.pt)) {
+                for(size_t i=0;i<app->visible.size();++i)if(app->files[app->visible[i]].path==selectedPath){app->beginDrag(static_cast<int>(i));break;}
+            }
+            return 0;
+        }
     }
     if(message==WM_CONTEXTMENU) {
         POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};

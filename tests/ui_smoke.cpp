@@ -65,8 +65,10 @@ void makeWave(const std::filesystem::path& file) {
     put32(output, 16); put16(output, 1); put16(output, 1); put32(output, rate);
     put32(output, rate * 2); put16(output, 2); put16(output, 16);
     output.write("data", 4); put32(output, dataBytes);
-    for (uint32_t i = 0; i < frames; ++i)
-        put16(output, static_cast<uint16_t>(static_cast<int16_t>(std::sin(i * 0.17) * 1000)));
+    for (uint32_t i = 0; i < frames; ++i) {
+        const double envelope = 0.2 + 0.8 * (1.0 - static_cast<double>(i) / frames);
+        put16(output, static_cast<uint16_t>(static_cast<int16_t>(std::sin(i * 0.17) * 1000 * envelope)));
+    }
     require(static_cast<bool>(output), "Could not create smoke-test WAV fixture");
 }
 
@@ -90,6 +92,7 @@ struct Process {
 void focusControl(HWND window, HWND control);
 void key(HWND window, UINT code);
 void clickScreen(POINT point);
+void captureWindow(HWND window, const std::filesystem::path& filename);
 
 struct ChildLookup { int id; HWND result{}; };
 BOOL CALLBACK findChild(HWND window, LPARAM parameter) {
@@ -140,8 +143,9 @@ void pumpFor(int milliseconds) {
 class DropTarget final : public IDropTarget {
 public:
     ULONG references = 1;
-    bool entered = false, dropped = false, matchedSource = false;
-    DWORD effect = DROPEFFECT_NONE, requestedEffect = DROPEFFECT_COPY;
+    bool enterCalled = false, entered = false, dropped = false, matchedSource = false;
+    HRESULT queryResult = E_PENDING;
+    DWORD offeredEffects = DROPEFFECT_NONE, effect = DROPEFFECT_NONE, requestedEffect = DROPEFFECT_COPY;
     std::wstring path, error;
     std::filesystem::path destination, expectedSource;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
@@ -154,7 +158,9 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { const ULONG result = --references; if (!result) delete this; return result; }
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* allowed) override {
         FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        entered = data && data->QueryGetData(&format) == S_OK;
+        enterCalled = true; offeredEffects = *allowed;
+        queryResult = data ? data->QueryGetData(&format) : E_POINTER;
+        entered = queryResult == S_OK;
         *allowed = entered && (*allowed & requestedEffect) ? requestedEffect : DROPEFFECT_NONE;
         return S_OK;
     }
@@ -235,6 +241,9 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
     POINT source{catWidth + 35, (row.top + row.bottom) / 2}; ClientToScreen(list, &source);
     RECT dropRect{}; GetClientRect(sink.window, &dropRect);
     POINT drop{(dropRect.left + dropRect.right) / 2, (dropRect.top + dropRect.bottom) / 2}; ClientToScreen(sink.window, &drop);
+    require(WindowFromPoint(source) == list, "Filename drag start is covered by another native window");
+    require(WindowFromPoint(drop) == sink.window, "File-drop target is covered by another native window");
+    std::cout << "Native drag source=" << source.x << ',' << source.y << " target=" << drop.x << ',' << drop.y << '\n';
     focusControl(process.window, list);
     // A completed filename click restarts the fixture before the drag, keeping
     // the decoder's real file handle open while the MOVE target completes.
@@ -242,15 +251,43 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
     moveScreen(source); mouseButton(MOUSEEVENTF_LEFTDOWN); pumpFor(50);
     moveScreen({source.x + 25, source.y + 2}); pumpFor(80); moveScreen(drop);
     try {
-        waitFor([&] { require(process.alive(), "App exited starting file drag"); return sink.target->entered; },
+        waitFor([&] { require(process.alive(), "App exited starting file drag"); return sink.target->enterCalled; },
                 "Dragged filename did not enter native CF_HDROP target", 4000);
+        require(sink.target->entered, "Native file drag did not offer CF_HDROP");
+        require((sink.target->offeredEffects & effect) != 0, "Native file drag did not offer requested copy/move effect");
         mouseButton(MOUSEEVENTF_LEFTUP);
         waitFor([&] { return sink.target->dropped; }, "Native file drop was not completed", 3000);
-    } catch (...) { mouseButton(MOUSEEVENTF_LEFTUP); std::wcerr << L"Native drop error: " << sink.target->error << L'\n'; throw; }
+        waitFor([&] {
+            require(process.alive(), "App exited completing native file drag");
+            return GetPropW(process.window, L"Abser.Smoke.DragActive") == nullptr;
+        }, "Source OLE drag loop did not return after the drop", 4000);
+    } catch (...) {
+        mouseButton(MOUSEEVENTF_LEFTUP);
+        try {
+            if (IsWindow(process.window)) captureWindow(process.window, L"ui-smoke-drag-source-failed.bmp");
+            if (IsWindow(sink.window)) captureWindow(sink.window, L"ui-smoke-drag-target-failed.bmp");
+        } catch (...) { /* Preserve the original drag failure if capture is unavailable. */ }
+        POINT cursor{}; GetCursorPos(&cursor);
+        GUITHREADINFO sourceGui{sizeof(sourceGui)};
+        GetGUIThreadInfo(GetWindowThreadProcessId(process.window, nullptr), &sourceGui);
+        std::wcerr << L"Native drop error: " << sink.target->error
+                   << L"; entered=" << sink.target->enterCalled << L"; formatHRESULT=" << sink.target->queryResult
+                   << L"; offeredEffects=" << sink.target->offeredEffects
+                   << L"; dragSerial=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragSerial"))
+                   << L"; dragActive=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragActive"))
+                   << L"; dragHRESULT=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragResult"))
+                   << L"; cursor=" << cursor.x << L',' << cursor.y
+                   << L"; capture=" << sourceGui.hwndCapture << L"; focus=" << sourceGui.hwndFocus << L'\n';
+        throw;
+    }
     require(sink.target->matchedSource, "File drag supplied a different original file");
     require(sink.target->effect == effect, "File drag did not honor native target effect");
     if (effect == DROPEFFECT_MOVE) {
-        waitFor([&] { return !std::filesystem::exists(expected); }, "Completed native MOVE did not remove original file");
+        waitFor([&] {
+            std::error_code error;
+            const bool exists = std::filesystem::exists(expected, error);
+            return !error && !exists;
+        }, "Completed native MOVE did not remove original file");
         require(std::filesystem::is_regular_file(destination) && readText(destination) == original, "Native MOVE destination bytes do not match original");
         waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == kFixtureCount - 1; }, "File list did not refresh after a native move");
         std::cout << "Native CF_HDROP MOVE passed with exact destination bytes.\n";

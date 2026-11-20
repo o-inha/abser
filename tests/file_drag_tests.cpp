@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -90,8 +91,18 @@ void testShellFormats(Fixture& fixture) {
     std::vector<wchar_t> dropped(length + 1);
     require(DragQueryFileW(handle, 0, dropped.data(), static_cast<UINT>(dropped.size())) == length,
             "Could not obtain Unicode drop path");
-    require(CompareStringOrdinal(fixture.file.c_str(), -1, dropped.data(), -1, TRUE) == CSTR_EQUAL,
-            "CF_HDROP path differs from the actual original Unicode file");
+    // Explorer may expand an 8.3 spelling in %TEMP% (for example RUNNER~1)
+    // when rendering CF_HDROP. Verify the actual file identity, not spelling.
+    std::error_code identityError;
+    const bool originalFile = std::filesystem::equivalent(std::filesystem::path(fixture.file),
+        std::filesystem::path(dropped.data()), identityError);
+    if (!originalFile || identityError) {
+        std::wcerr << L"Original fixture: " << fixture.file << L"\nShell drop path: "
+                   << dropped.data() << L'\n';
+        if (identityError) std::cerr << "File identity error: " << identityError.message() << '\n';
+    }
+    require(originalFile && !identityError,
+            "CF_HDROP does not identify the actual original Unicode file");
     const auto* dropHeader = static_cast<const DROPFILES*>(GlobalLock(medium.medium.hGlobal));
     require(dropHeader != nullptr, "Could not lock DROPFILES structure");
     const bool isUnicode = dropHeader->fWide != FALSE;
