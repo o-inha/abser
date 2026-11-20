@@ -19,8 +19,8 @@ Supported audio: WAV/WAVE, AIFF/AIFC (PCM and floating point), MP3, FLAC, and Og
 - Use the slim horizontal and vertical scrollbar thumbs to move around the list. Mouse-wheel scrolling is animated; arrow-key auditioning responds immediately.
 - The waveform and playback cursor appear above the transport controls. Waveform previews load in the background while audio plays.
 - Click anywhere on the volume slider to jump to that level, or drag it to adjust playback volume.
-- Drag an audio file from the list to Explorer or a DAW. Windows negotiates the drag operation with the destination, including copy, move, and link where supported.
-- Starting a file drag pauses the preview. Holding the mouse button still continues playback; releasing or cancelling a drag does not resume it automatically.
+- Drag an audio file from the list to Explorer, desktop, app, etc. Windows negotiates the drag operation with the destination, including copy, move, and link where supported.
+- Starting a file drag pauses the preview. Cancelling a drag does not resume it automatically.
 
 Shortcuts: **Ctrl+L** focuses the path, **Ctrl+O** opens the folder chooser, **F5** refreshes the directory, **C** opens the selected file's category picker, and **Escape** stops playback while the list has focus. You can also drop a folder or audio file onto the window to open its directory.
 
