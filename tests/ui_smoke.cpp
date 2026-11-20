@@ -133,6 +133,18 @@ void mouseButton(DWORD flags) {
     INPUT event{}; event.type = INPUT_MOUSE; event.mi.dwFlags = flags;
     require(SendInput(1, &event, sizeof(event)) == 1, "Could not change native test mouse button");
 }
+UINT_PTR audioState(const Process& process) {
+    return static_cast<UINT_PTR>(SendMessageW(process.window, WM_APP + 5, 0, 0));
+}
+void waitAudioState(const Process& process, UINT_PTR expected, const char* message) {
+    waitFor([&] { require(process.alive(), "App exited while checking playback state"); return audioState(process) == expected; }, message, 1500);
+}
+void inputKey(WORD code) {
+    INPUT input[2]{};
+    input[0].type = INPUT_KEYBOARD; input[0].ki.wVk = code;
+    input[1].type = INPUT_KEYBOARD; input[1].ki.wVk = code; input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    require(SendInput(2, input, sizeof(INPUT)) == 2, "Could not inject native drag cancellation key");
+}
 void pumpFor(int milliseconds) {
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
     while (std::chrono::steady_clock::now() < until) {
@@ -228,7 +240,7 @@ public:
 
 std::string readText(const std::filesystem::path& path);
 void testFileDrag(Process& process, HWND list, const std::filesystem::path& expected,
-                  DWORD effect = DROPEFFECT_COPY, const std::filesystem::path& destination = {}) {
+                  DWORD effect = DROPEFFECT_COPY, const std::filesystem::path& destination = {}, bool cancel = false) {
     const std::string original = readText(expected);
     focusControl(process.window, list); key(list, VK_HOME);
     SendMessageW(list, LVM_ENSUREVISIBLE, 0, FALSE);
@@ -248,19 +260,41 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
     // A completed filename click restarts the fixture before the drag, keeping
     // the decoder's real file handle open while the MOVE target completes.
     clickScreen(source); pumpFor(80);
-    moveScreen(source); mouseButton(MOUSEEVENTF_LEFTDOWN); pumpFor(50);
-    moveScreen({source.x + 25, source.y + 2}); pumpFor(80); moveScreen(drop);
+    moveScreen(source); mouseButton(MOUSEEVENTF_LEFTDOWN);
     try {
+        // A held click must already play; only crossing the drag threshold pauses.
+        waitAudioState(process, 3, "Filename mouse-down did not start audio before release");
+        pumpFor(70);
+        require(audioState(process) == 3, "Holding a filename still paused playback before dragging");
+        const int jitter = std::min(1, std::max(0, (GetSystemMetrics(SM_CXDRAG) - 1) / 2));
+        POINT held{}; GetCursorPos(&held);
+        require(SetCursorPos(held.x + jitter, held.y) != FALSE, "Could not apply sub-threshold pointer jitter");
+        pumpFor(70);
+        require(audioState(process) == 3, "Sub-threshold mouse jitter paused normal click playback");
+        moveScreen({source.x + std::max(25, GetSystemMetrics(SM_CXDRAG) + 4), source.y + 2});
+        waitFor([&] { return GetPropW(process.window, L"Abser.Smoke.DragActive") != nullptr; }, "Crossing drag threshold did not begin native drag", 2000);
+        waitAudioState(process, 4, "Beginning a native drag did not pause the playing file");
+        moveScreen(drop);
+
         waitFor([&] { require(process.alive(), "App exited starting file drag"); return sink.target->enterCalled; },
                 "Dragged filename did not enter native CF_HDROP target", 4000);
         require(sink.target->entered, "Native file drag did not offer CF_HDROP");
         require((sink.target->offeredEffects & effect) != 0, "Native file drag did not offer requested copy/move effect");
-        mouseButton(MOUSEEVENTF_LEFTUP);
-        waitFor([&] { return sink.target->dropped; }, "Native file drop was not completed", 3000);
-        waitFor([&] {
-            require(process.alive(), "App exited completing native file drag");
-            return GetPropW(process.window, L"Abser.Smoke.DragActive") == nullptr;
-        }, "Source OLE drag loop did not return after the drop", 4000);
+        waitAudioState(process, 4, "Audio resumed while dragging over the native drop target");
+        pumpFor(70);
+        require(audioState(process) == 4, "Audio did not remain paused while a file was being dragged");
+        if (cancel) {
+            inputKey(VK_ESCAPE);
+            waitFor([&] { return GetPropW(process.window, L"Abser.Smoke.DragActive") == nullptr; }, "Escape did not cancel the native file drag", 4000);
+            mouseButton(MOUSEEVENTF_LEFTUP);
+        } else {
+            mouseButton(MOUSEEVENTF_LEFTUP);
+            waitFor([&] { return sink.target->dropped; }, "Native file drop was not completed", 3000);
+            waitFor([&] {
+                require(process.alive(), "App exited completing native file drag");
+                return GetPropW(process.window, L"Abser.Smoke.DragActive") == nullptr;
+            }, "Source OLE drag loop did not return after the drop", 4000);
+        }
     } catch (...) {
         mouseButton(MOUSEEVENTF_LEFTUP);
         try {
@@ -276,9 +310,18 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
                    << L"; dragSerial=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragSerial"))
                    << L"; dragActive=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragActive"))
                    << L"; dragHRESULT=" << reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragResult"))
+                   << L"; audioState=" << audioState(process)
                    << L"; cursor=" << cursor.x << L',' << cursor.y
                    << L"; capture=" << sourceGui.hwndCapture << L"; focus=" << sourceGui.hwndFocus << L'\n';
         throw;
+    }
+    if (cancel) {
+        require(!sink.target->dropped, "Cancelled drag unexpectedly dropped a file");
+        require(reinterpret_cast<UINT_PTR>(GetPropW(process.window, L"Abser.Smoke.DragResult")) == static_cast<UINT_PTR>(DRAGDROP_S_CANCEL), "Native drag did not report cancellation");
+        waitAudioState(process, 4, "Cancelled drag automatically resumed playback");
+        require(std::filesystem::is_regular_file(expected) && readText(expected) == original, "Cancelled drag changed the original file");
+        std::cout << "Native drag cancellation kept audio paused and source unchanged.\n";
+        return;
     }
     require(sink.target->matchedSource, "File drag supplied a different original file");
     require(sink.target->effect == effect, "File drag did not honor native target effect");
@@ -293,7 +336,8 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
         std::cout << "Native CF_HDROP MOVE passed with exact destination bytes.\n";
     } else {
         require(std::filesystem::is_regular_file(expected) && readText(expected) == original, "Copy drag removed or changed source file");
-        std::cout << "Native CF_HDROP COPY passed.\n";
+        waitAudioState(process, 4, "Successful COPY drag automatically resumed playback");
+        std::cout << "Native CF_HDROP COPY passed with audio remaining paused.\n";
     }
 }
 
@@ -555,6 +599,7 @@ int run(const std::filesystem::path& executable) {
                  verticalRect.top + (verticalRect.bottom - verticalRect.top) * 4 / 5});
     waitFor([&] { return SendMessageW(list, LVM_GETTOPINDEX, 0, 0) > 0; }, "Custom vertical scrollbar did not move the file list");
     captureWindow(process.window, L"ui-smoke-vertical-scroll.bmp");
+    testFileDrag(process, list, audio / L"take1.wav", DROPEFFECT_COPY, {}, true);
     testFileDrag(process, list, audio / L"take1.wav");
     const auto moved = root / L"Moved file \u65e5\u672c\u8a9e.wav";
     testFileDrag(process, list, audio / L"take1.wav", DROPEFFECT_MOVE, moved);

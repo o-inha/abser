@@ -236,6 +236,16 @@ int main() {
 
         abser::AudioEngine audio;
         check(audio.initialize(true), "Silent test output must initialize");
+        // Submit then immediately pause, before the asynchronous open/decode is
+        // guaranteed to have completed. The worker must preserve this intent.
+        audio.play(first.wstring());
+        audio.pause();
+        check(audio.snapshot().state == AudioState::Paused && audio.snapshot().path == first.wstring(), "Immediate pause must preserve the selected loading file");
+        std::this_thread::sleep_for(20ms);
+        const double loadingPausedAt = audio.snapshot().positionSeconds;
+        audio.pause();
+        std::this_thread::sleep_for(45ms);
+        check(audio.snapshot().state == AudioState::Paused && std::abs(audio.snapshot().positionSeconds - loadingPausedAt) < .001, "Decoder startup must not resume a file paused during loading");
         audio.play(first.wstring());
         check(eventually([&] { auto s = audio.snapshot(); return s.state == AudioState::Playing && s.positionSeconds > .025; }), "WAV must start and advance");
         check(audio.waveformSnapshot().loading, "Playback must start while waveform work is still deferred");
@@ -247,6 +257,16 @@ int main() {
         check(std::abs(audio.snapshot().positionSeconds - pausedAt) < .001, "Paused stream must not advance");
         audio.togglePause();
         check(eventually([&] { return audio.snapshot().positionSeconds > pausedAt + .02; }), "Resume must continue at paused position");
+        audio.pause();
+        check(audio.snapshot().state == AudioState::Paused, "Idempotent pause must pause playing audio");
+        std::this_thread::sleep_for(20ms);
+        const auto dragPaused = audio.snapshot();
+        audio.pause();
+        audio.pause();
+        std::this_thread::sleep_for(45ms);
+        check(audio.snapshot().state == AudioState::Paused && audio.snapshot().path == dragPaused.path && std::abs(audio.snapshot().positionSeconds - dragPaused.positionSeconds) < .001, "Repeated pause must preserve state, selection, and frozen position");
+        audio.togglePause();
+        check(eventually([&] { return audio.snapshot().positionSeconds > dragPaused.positionSeconds + .02; }), "Space must resume an idempotently paused file in place");
 
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < 500; ++i) audio.play(i % 2 ? first.wstring() : second.wstring());
@@ -257,15 +277,29 @@ int main() {
         audio.stop();
         std::this_thread::sleep_for(25ms);
         check(audio.snapshot().state == AudioState::Stopped && audio.snapshot().positionSeconds < .001, "Stop must reset playback position");
+        const auto stoppedSelection = audio.snapshot().path;
+        audio.pause();
+        audio.pause();
+        std::this_thread::sleep_for(25ms);
+        check(audio.snapshot().state == AudioState::Stopped && audio.snapshot().path == stoppedSelection && audio.snapshot().positionSeconds < .001, "Pause must never restart a stopped file or change its selection");
         audio.togglePause();
         check(eventually([&] { return audio.snapshot().state == AudioState::Playing; }), "Space after Stop must restart selected file");
         audio.play(shortFile.wstring());
         check(eventually([&] { return audio.snapshot().state == AudioState::Finished; }), "Short file must reach EOF without auto-playing another file");
         check(std::abs(audio.snapshot().positionSeconds - .08) < .003, "EOF must preserve actual duration");
+        audio.pause();
+        audio.pause();
+        std::this_thread::sleep_for(25ms);
+        check(audio.snapshot().state == AudioState::Finished && audio.snapshot().path == shortFile.wstring() && std::abs(audio.snapshot().positionSeconds - .08) < .003, "Pause at EOF must never restart the selected file");
         audio.togglePause();
         check(eventually([&] { return audio.snapshot().state == AudioState::Playing; }), "Space at EOF must restart");
         audio.play(broken.wstring());
         check(eventually([&] { return audio.snapshot().state == AudioState::Error; }), "Damaged file must report error");
+        const auto decodeError = audio.snapshot().error;
+        audio.pause();
+        audio.pause();
+        std::this_thread::sleep_for(20ms);
+        check(audio.snapshot().state == AudioState::Error && audio.snapshot().path == broken.wstring() && audio.snapshot().error == decodeError, "Pause must preserve a failed file without retrying playback");
         audio.play(first.wstring());
         check(eventually([&] { return audio.snapshot().state == AudioState::Playing; }), "Good file must play after damaged file");
         std::thread metadata([&] { for (int i = 0; i < 100; ++i) check(std::abs(abser::probeDuration(second.wstring()) - 3.0) < .001, "Concurrent metadata probing must not disturb playback"); });
@@ -364,7 +398,7 @@ int main() {
         audio.shutdown();
         check(std::chrono::steady_clock::now() - shutdownStart < 1500ms, "Shutdown must cancel pending waveform work");
         std::filesystem::remove_all(dir);
-        std::cout << "Audio tests passed: duration, playback, pause/resume, rapid switching, stop/reset, EOF, malformed file recovery, AIFF/AIFC PCM/float/little-endian, waveform peaks/duration/cancellation/cache, file sharing.\n";
+        std::cout << "Audio tests passed: duration, playback, pause/resume, rapid switching, stop/reset, EOF, malformed file recovery, AIFF/AIFC PCM/float/little-endian, waveform peaks/duration/cancellation/cache, file sharing, idempotent pause.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

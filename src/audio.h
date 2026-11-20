@@ -41,6 +41,8 @@ public:
     void setNotify(std::function<void()> notify);
     void play(const std::wstring& path);
     void togglePause();
+    // Idempotent: pauses active/loading playback and never restarts a file.
+    void pause();
     void stop();
     void setVolume(float volume);
     AudioSnapshot snapshot() const;

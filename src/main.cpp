@@ -34,7 +34,7 @@
 
 namespace {
 using namespace abser;
-constexpr UINT WM_SCAN = WM_APP + 1, WM_DURATION = WM_APP + 2, WM_AUDIO = WM_APP + 3, WM_AUDIO_READY = WM_APP + 4;
+constexpr UINT WM_SCAN = WM_APP + 1, WM_DURATION = WM_APP + 2, WM_AUDIO = WM_APP + 3, WM_AUDIO_READY = WM_APP + 4, WM_QUERY_AUDIO = WM_APP + 5;
 constexpr UINT TIMER_UI = 1, TIMER_SAVE = 2;
 constexpr int ID_PATH = 101, ID_OPEN = 102, ID_LIST = 103, ID_VOLUME = 104, ID_PLAY = 105, ID_FILTER = 200;
 constexpr int LIST_TOP = 72, FOOTER_HEIGHT = 152;
@@ -171,6 +171,11 @@ struct App {
     void categoryForSelection() { int row=selected(); if(row<0) return; RECT r{}; ListView_GetSubItemRect(list,row,0,LVIR_BOUNDS,&r); POINT p{r.left,r.bottom}; ClientToScreen(list,&p); assignCategory(row,p); }
     void beginDrag(int row) {
         const auto* file=entry(row);if(!file)return;const std::wstring value=file->path;++dragSerial;
+        // The initial press still auditions immediately. Only movement beyond
+        // Windows' drag threshold reaches this point and pauses that preview.
+        if(audioStarting) {if(!queuedPlay.empty()){queuedPaused=true;playback.state=AudioState::Paused;}}
+        else audio.pause();
+        updateAudio();
         if(smokeTest) {SetPropW(window,L"Abser.Smoke.DragSerial",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(dragSerial)));SetPropW(window,L"Abser.Smoke.DragActive",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(1)));}
         auto result=dragFile(window,value);
         if(smokeTest) {SetPropW(window,L"Abser.Smoke.DragResult",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(static_cast<uint32_t>(result.result))));RemovePropW(window,L"Abser.Smoke.DragActive");}
@@ -186,6 +191,7 @@ struct App {
         if(waveform.path==playback.path&&waveform.durationSeconds>0&&playback.durationSeconds<0)playback.durationSeconds=waveform.durationSeconds;
         if(changed||before.state!=playback.state||before.path!=playback.path||before.error!=playback.error||before.durationSeconds!=playback.durationSeconds||std::abs(before.positionSeconds-playback.positionSeconds)>0.0005)invalidateTransport();
         if(before.state!=playback.state)InvalidateRect(play,nullptr,FALSE);
+        if(smokeTest)SetPropW(window,L"Abser.Smoke.AudioState",reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(playback.state)+1));
     }
 };
 App* app = nullptr;
@@ -512,9 +518,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
         InvalidateRect(a->list,nullptr,FALSE);return 0;
     }
     case WM_AUDIO: a->updateAudio();return 0;
+    case WM_QUERY_AUDIO: return a->smokeTest?static_cast<LRESULT>(a->audioStarting?a->playback.state:a->audio.snapshot().state)+1:0;
     case WM_AUDIO_READY:
         if(a->audioInit.joinable())a->audioInit.join();a->audioStarting=false;a->audioReady=wParam!=0;
-        if(a->audioReady&&!a->queuedPlay.empty()) {a->audio.play(a->queuedPlay);if(a->queuedPaused)a->audio.togglePause();}
+        if(a->audioReady&&!a->queuedPlay.empty()) {a->audio.play(a->queuedPlay);if(a->queuedPaused)a->audio.pause();}
         a->queuedPlay.clear();a->queuedPaused=false;a->updateAudio();return 0;
     case WM_TIMER: if(wParam==TIMER_SAVE){KillTimer(hwnd,TIMER_SAVE);a->save();}else if(wParam==TIMER_UI){a->updateAudio();if(a->durationSortDirty){a->durationSortDirty=false;a->rebuild();}}return 0;
     case WM_DROPFILES: {HDROP drop=reinterpret_cast<HDROP>(wParam);wchar_t path[32768];if(DragQueryFileW(drop,0,path,32768)){std::filesystem::path value(path);std::error_code ec;if(!std::filesystem::is_directory(value,ec))value=value.parent_path();SetWindowTextW(a->path,value.c_str());a->load(value.wstring());}DragFinish(drop);return 0;}

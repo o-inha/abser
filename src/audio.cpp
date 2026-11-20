@@ -822,6 +822,21 @@ void AudioEngine::togglePause() {
     self.wake.notify_one();
 }
 
+void AudioEngine::pause() {
+    auto& self = *impl_;
+    {
+        // Serialize against a new play/stop request, then inspect the live state
+        // rather than a snapshot that could already have reached EOF.
+        std::lock_guard<std::mutex> requestLock(self.requestMutex);
+        std::lock_guard<std::mutex> stateLock(self.stateMutex);
+        if (self.state.state != AudioState::Playing && self.state.state != AudioState::Loading) return;
+        self.paused.store(true);
+        self.state.state = AudioState::Paused;
+    }
+    self.wake.notify_one();
+    self.signal();
+}
+
 void AudioEngine::stop() {
     auto& self = *impl_;
     uint64_t serial;
