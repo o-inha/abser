@@ -301,7 +301,8 @@ LRESULT CALLBACK ListProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
             if(same)app->playRow(row);UpdateWindow(hwnd);
             // Explicitly detect drags in every text column, including a second
             // rapid click. Native report views do not handle all these cases.
-            if(DragDetect(hwnd,hit.pt)) {
+            POINT dragOrigin=hit.pt;
+            if(ClientToScreen(hwnd,&dragOrigin)&&DragDetect(hwnd,dragOrigin)) {
                 for(size_t i=0;i<app->visible.size();++i)if(app->files[app->visible[i]].path==selectedPath){app->beginDrag(static_cast<int>(i));break;}
             }
             return 0;
