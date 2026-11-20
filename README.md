@@ -1,6 +1,6 @@
 # Abser
 
-A small, portable Windows x64 audio browser. Open a folder and audition its audio files with a click or the arrow keys. Designed for a tall, narrow window beside your DAW.
+A small, portable Windows x64 audio browser. Open a folder and audition its audio files with a click or the arrow keys. Designed for a tall, narrow window beside your main app (DAW, video editor, etc).
 
 ## Run
 
