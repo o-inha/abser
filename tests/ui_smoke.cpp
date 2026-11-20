@@ -11,6 +11,8 @@
 #endif
 #include <windows.h>
 #include <commctrl.h>
+#include <ole2.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -22,20 +24,28 @@
 #include <iterator>
 #include <vector>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <thread>
 
 namespace {
-constexpr int kPath = 101, kList = 103, kFilter = 200;
+constexpr int kPath = 101, kList = 103, kVolume = 104, kPlay = 105, kFilter = 200;
+constexpr int kFixtureCount = 64, kVerticalRail = 0x6A11, kHorizontalRail = 0x6A12;
 constexpr wchar_t kWindowClass[] = L"AbserWindow";
 
 void require(bool condition, const char* error) {
     if (!condition) throw std::runtime_error(error);
 }
 
+void pumpMessages() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+}
+
 template<class Predicate> void waitFor(Predicate predicate, const char* error, int timeoutMs = 5000) {
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     do {
+        pumpMessages();
         if (predicate()) return;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (std::chrono::steady_clock::now() < until);
@@ -76,6 +86,179 @@ struct Process {
     }
     bool alive() const { return WaitForSingleObject(info.hProcess, 0) == WAIT_TIMEOUT; }
 };
+
+void focusControl(HWND window, HWND control);
+void key(HWND window, UINT code);
+void clickScreen(POINT point);
+
+struct ChildLookup { int id; HWND result{}; };
+BOOL CALLBACK findChild(HWND window, LPARAM parameter) {
+    auto& lookup = *reinterpret_cast<ChildLookup*>(parameter);
+    if (GetDlgCtrlID(window) != lookup.id) return TRUE;
+    lookup.result = window; return FALSE;
+}
+HWND childControl(HWND parent, int id) {
+    if (const auto direct = GetDlgItem(parent, id)) return direct;
+    ChildLookup lookup{id}; EnumChildWindows(parent, findChild, reinterpret_cast<LPARAM>(&lookup));
+    return lookup.result;
+}
+
+RECT remoteRect(const Process& process, HWND control, UINT message, WPARAM parameter, RECT initial = {}) {
+    void* remote = VirtualAllocEx(process.info.hProcess, nullptr, sizeof(RECT), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    require(remote != nullptr, "Could not allocate native-control test data");
+    SIZE_T copied = 0;
+    const BOOL written = WriteProcessMemory(process.info.hProcess, remote, &initial, sizeof(initial), &copied);
+    if (!written || copied != sizeof(initial)) { VirtualFreeEx(process.info.hProcess, remote, 0, MEM_RELEASE); throw std::runtime_error("Could not write native-control test data"); }
+    SendMessageW(control, message, parameter, reinterpret_cast<LPARAM>(remote));
+    RECT result{};
+    const BOOL read = ReadProcessMemory(process.info.hProcess, remote, &result, sizeof(result), &copied);
+    VirtualFreeEx(process.info.hProcess, remote, 0, MEM_RELEASE);
+    require(read && copied == sizeof(result), "Could not read native-control rectangle");
+    return result;
+}
+
+void moveScreen(POINT point) {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN), top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN), height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    INPUT event{}; event.type = INPUT_MOUSE;
+    event.mi.dx = MulDiv(point.x - left, 65535, width - 1);
+    event.mi.dy = MulDiv(point.y - top, 65535, height - 1);
+    event.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    require(SendInput(1, &event, sizeof(event)) == 1, "Could not move native test pointer");
+}
+void mouseButton(DWORD flags) {
+    INPUT event{}; event.type = INPUT_MOUSE; event.mi.dwFlags = flags;
+    require(SendInput(1, &event, sizeof(event)) == 1, "Could not change native test mouse button");
+}
+void pumpFor(int milliseconds) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    while (std::chrono::steady_clock::now() < until) {
+        pumpMessages(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+class DropTarget final : public IDropTarget {
+public:
+    ULONG references = 1;
+    bool entered = false, dropped = false, matchedSource = false;
+    DWORD effect = DROPEFFECT_NONE, requestedEffect = DROPEFFECT_COPY;
+    std::wstring path, error;
+    std::filesystem::path destination, expectedSource;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_IDropTarget)) { *object = static_cast<IDropTarget*>(this); AddRef(); return S_OK; }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { const ULONG result = --references; if (!result) delete this; return result; }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* allowed) override {
+        FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        entered = data && data->QueryGetData(&format) == S_OK;
+        *allowed = entered && (*allowed & requestedEffect) ? requestedEffect : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* allowed) override {
+        *allowed = entered && (*allowed & requestedEffect) ? requestedEffect : DROPEFFECT_NONE; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override { entered = false; return S_OK; }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL, DWORD* allowed) override {
+        FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL}; STGMEDIUM medium{};
+        *allowed = DROPEFFECT_NONE;
+        if (!data || FAILED(data->GetData(&format, &medium))) return DV_E_FORMATETC;
+        const HDROP files = reinterpret_cast<HDROP>(medium.hGlobal);
+        if (DragQueryFileW(files, 0xffffffffu, nullptr, 0) == 1) {
+            const UINT length = DragQueryFileW(files, 0, nullptr, 0);
+            path.resize(static_cast<size_t>(length) + 1);
+            DragQueryFileW(files, 0, path.data(), length + 1); path.resize(length);
+            std::error_code identityError;
+            matchedSource = std::filesystem::equivalent(std::filesystem::path(path), expectedSource, identityError) && !identityError;
+            bool complete = matchedSource;
+            if (complete && requestedEffect == DROPEFFECT_MOVE) {
+                complete = CopyFileW(path.c_str(), destination.c_str(), TRUE) != FALSE;
+                if (!complete) error = L"Target copy failed: " + std::to_wstring(GetLastError());
+                if (complete) {
+                    // A real shell move target writes the performed effect only
+                    // after the original bytes are safely present at destination.
+                    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+                    if (!memory) complete = false;
+                    else {
+                        void* locked = GlobalLock(memory);
+                        if (!locked) { GlobalFree(memory); complete = false; }
+                        else {
+                            *static_cast<DWORD*>(locked) = DROPEFFECT_MOVE; GlobalUnlock(memory);
+                            FORMATETC performed{static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Performed DropEffect")), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+                            STGMEDIUM stored{}; stored.tymed = TYMED_HGLOBAL; stored.hGlobal = memory;
+                            const HRESULT accepted = data->SetData(&performed, &stored, TRUE);
+                            if (FAILED(accepted)) { GlobalFree(memory); complete = false; error = L"Source rejected performed MOVE: " + std::to_wstring(accepted); }
+                        }
+                    }
+                }
+            }
+            if (complete) { dropped = true; effect = requestedEffect; *allowed = requestedEffect; }
+        }
+        ReleaseStgMedium(&medium); return dropped ? S_OK : DV_E_FORMATETC;
+    }
+};
+
+class DropWindow {
+public:
+    HWND window{}; DropTarget* target = new DropTarget;
+    explicit DropWindow(const RECT& source, DWORD effect, const std::filesystem::path& destination, const std::filesystem::path& expected) {
+        target->requestedEffect = effect; target->destination = destination; target->expectedSource = expected;
+        WNDCLASSW cls{}; cls.lpfnWndProc = DefWindowProcW; cls.hInstance = GetModuleHandleW(nullptr);
+        cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1); cls.lpszClassName = L"AbserSmokeDropTarget";
+        RegisterClassW(&cls);
+        RECT work{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        const int width = 230, height = 160;
+        int x = source.right + 30; if (x + width > work.right) x = std::max(work.left, source.left - width - 30);
+        window = CreateWindowExW(WS_EX_TOPMOST, cls.lpszClassName, L"Native file drop test", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                x, source.top + 90, width, height, nullptr, nullptr, cls.hInstance, nullptr);
+        require(window && SUCCEEDED(RegisterDragDrop(window, target)), "Could not register native file-drop target");
+        UpdateWindow(window);
+    }
+    ~DropWindow() { if (window) { RevokeDragDrop(window); DestroyWindow(window); } target->Release(); }
+};
+
+std::string readText(const std::filesystem::path& path);
+void testFileDrag(Process& process, HWND list, const std::filesystem::path& expected,
+                  DWORD effect = DROPEFFECT_COPY, const std::filesystem::path& destination = {}) {
+    const std::string original = readText(expected);
+    focusControl(process.window, list); key(list, VK_HOME);
+    SendMessageW(list, LVM_ENSUREVISIBLE, 0, FALSE);
+    waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) == 0 && SendMessageW(list, LVM_GETTOPINDEX, 0, 0) == 0; },
+            "Could not position first filename for drag");
+    RECT sourceWindow{}; GetWindowRect(process.window, &sourceWindow); DropWindow sink(sourceWindow, effect, destination, expected);
+    RECT row = remoteRect(process, list, LVM_GETITEMRECT, 0);
+    require(row.bottom > row.top, "Could not locate native filename row for dragging");
+    const int catWidth = static_cast<int>(SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0));
+    POINT source{catWidth + 35, (row.top + row.bottom) / 2}; ClientToScreen(list, &source);
+    RECT dropRect{}; GetClientRect(sink.window, &dropRect);
+    POINT drop{(dropRect.left + dropRect.right) / 2, (dropRect.top + dropRect.bottom) / 2}; ClientToScreen(sink.window, &drop);
+    focusControl(process.window, list);
+    // A completed filename click restarts the fixture before the drag, keeping
+    // the decoder's real file handle open while the MOVE target completes.
+    clickScreen(source); pumpFor(80);
+    moveScreen(source); mouseButton(MOUSEEVENTF_LEFTDOWN); pumpFor(50);
+    moveScreen({source.x + 25, source.y + 2}); pumpFor(80); moveScreen(drop);
+    try {
+        waitFor([&] { require(process.alive(), "App exited starting file drag"); return sink.target->entered; },
+                "Dragged filename did not enter native CF_HDROP target", 4000);
+        mouseButton(MOUSEEVENTF_LEFTUP);
+        waitFor([&] { return sink.target->dropped; }, "Native file drop was not completed", 3000);
+    } catch (...) { mouseButton(MOUSEEVENTF_LEFTUP); std::wcerr << L"Native drop error: " << sink.target->error << L'\n'; throw; }
+    require(sink.target->matchedSource, "File drag supplied a different original file");
+    require(sink.target->effect == effect, "File drag did not honor native target effect");
+    if (effect == DROPEFFECT_MOVE) {
+        waitFor([&] { return !std::filesystem::exists(expected); }, "Completed native MOVE did not remove original file");
+        require(std::filesystem::is_regular_file(destination) && readText(destination) == original, "Native MOVE destination bytes do not match original");
+        waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == kFixtureCount - 1; }, "File list did not refresh after a native move");
+        std::cout << "Native CF_HDROP MOVE passed with exact destination bytes.\n";
+    } else {
+        require(std::filesystem::is_regular_file(expected) && readText(expected) == original, "Copy drag removed or changed source file");
+        std::cout << "Native CF_HDROP COPY passed.\n";
+    }
+}
 
 BOOL CALLBACK findWindow(HWND window, LPARAM parameter) {
     auto& process = *reinterpret_cast<Process*>(parameter);
@@ -137,6 +320,30 @@ void captureWindow(HWND window, const std::filesystem::path& filename) {
     require(static_cast<bool>(output), "Could not write native UI screenshot");
 }
 
+bool renderedWaveform(HWND window) {
+    RECT client{}; GetClientRect(window, &client); const UINT dpi = GetDpiForWindow(window);
+    const int width = client.right, height = client.bottom;
+    if (width <= 0 || height <= MulDiv(150, dpi, 96)) return false;
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    HDC screen = GetDC(nullptr), memory = CreateCompatibleDC(screen); void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0); ReleaseDC(nullptr, screen);
+    if (!memory || !bitmap || !pixels) { if (bitmap) DeleteObject(bitmap); if (memory) DeleteDC(memory); return false; }
+    HGDIOBJ old = SelectObject(memory, bitmap); const BOOL printed = PrintWindow(window, memory, PW_CLIENTONLY | 2); GdiFlush();
+    const int x1 = MulDiv(12, dpi, 96), x2 = width - x1;
+    const int middle = height - MulDiv(121, dpi, 96), y = middle - MulDiv(5, dpi, 96);
+    int columns = 0;
+    if (printed && y >= 0 && y < height) {
+        const auto* row = static_cast<const uint32_t*>(pixels) + static_cast<size_t>(y) * width;
+        for (int x = x1; x < x2; ++x) {
+            const uint32_t rgb = row[x] & 0xffffffu;
+            if (rgb == 0x69777eu || rgb == 0xc3dba4u) ++columns;
+        }
+    }
+    SelectObject(memory, old); DeleteObject(bitmap); DeleteDC(memory);
+    return columns > (x2 - x1) / 2;
+}
+
 void focusControl(HWND window, HWND control) {
     const DWORD targetThread = GetWindowThreadProcessId(window, nullptr);
     const DWORD currentThread = GetCurrentThreadId();
@@ -190,7 +397,7 @@ int run(const std::filesystem::path& executable) {
     const auto empty = root / L"Empty folder";
     const auto metadata = root / L"App data" / L"metadata.txt";
     std::filesystem::create_directories(audio); std::filesystem::create_directories(empty);
-    for (int i = 0; i < 16; ++i) makeWave(audio / (L"take" + std::to_wstring(i + 1) + L".wav"));
+    for (int i = 0; i < kFixtureCount; ++i) makeWave(audio / (L"take" + std::to_wstring(i + 1) + L".wav"));
 
     Process process;
     std::wstring command = L"\"" + executable.wstring() + L"\" --smoke-test-data \"" + metadata.wstring() + L"\" \"" + audio.wstring() + L"\"";
@@ -206,12 +413,12 @@ int run(const std::filesystem::path& executable) {
     HWND path = nullptr, list = nullptr;
     waitFor([&] {
         require(process.alive(), "Abser exited creating native controls");
-        path = GetDlgItem(process.window, kPath); list = GetDlgItem(process.window, kList);
+        path = childControl(process.window, kPath); list = childControl(process.window, kList);
         if (!path || !list || !GetDlgItem(process.window, kFilter + 10)) return false;
         const HWND header = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETHEADER, 0, 0));
         return header && SendMessageW(header, HDM_GETITEMCOUNT, 0, 0) == 4;
     }, "Required native controls were not created");
-    waitFor([&] { require(process.alive(), "Abser exited loading initial folder"); return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; },
+    waitFor([&] { require(process.alive(), "Abser exited loading initial folder"); return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == kFixtureCount; },
             "Initial folder was not loaded");
     HWND header = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETHEADER, 0, 0));
     require(header && SendMessageW(header, HDM_GETITEMCOUNT, 0, 0) == 4, "File list must have four columns");
@@ -219,17 +426,36 @@ int run(const std::filesystem::path& executable) {
     const UINT dpi = GetDpiForWindow(process.window);
     require(windowRect.right - windowRect.left <= MulDiv(600, dpi, 96), "Default window is unexpectedly wide");
     captureWindow(process.window, L"ui-smoke-default.bmp");
+    RECT pathRect{}, playRect{}, volumeRect{};
+    GetWindowRect(path, &pathRect);
+    require(pathRect.bottom - pathRect.top <= MulDiv(24, dpi, 96), "Address field is not compact");
+    require((GetWindowLongPtrW(path, GWL_EXSTYLE) & WS_EX_CLIENTEDGE) == 0 &&
+            (GetWindowLongPtrW(path, GWL_STYLE) & WS_BORDER) == 0, "Address field still has a native border");
+    HWND play = childControl(process.window, kPlay), volume = childControl(process.window, kVolume);
+    require(play && volume, "Transport or volume control is missing");
+    GetWindowRect(play, &playRect); GetWindowRect(volume, &volumeRect);
+    require(volumeRect.top - playRect.bottom >= MulDiv(10, dpi, 96), "Transport and volume need a visible margin");
+    // Start far from the desired point so a native five-step page change cannot pass.
+    SendMessageW(volume, TBM_SETPOS, TRUE, 5);
+    const RECT channel = remoteRect(process, volume, TBM_GETCHANNELRECT, 0);
+    require(channel.right > channel.left, "Volume channel rectangle is invalid");
+    POINT volumeClick{channel.left + (channel.right - channel.left) * 3 / 4, (channel.top + channel.bottom) / 2};
+    ClientToScreen(volume, &volumeClick); clickScreen(volumeClick);
+    waitFor([&] { const auto value = SendMessageW(volume, TBM_GETPOS, 0, 0); return value >= 71 && value <= 79; },
+            "Volume track click did not jump to the clicked position");
 
     // Native Down travels through the application's outer keyboard loop.
     focusControl(process.window, list); key(list, VK_DOWN);
     waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) == 0; }, "Down did not select the first file");
+    waitFor([&] { return renderedWaveform(process.window); }, "Audio waveform was not rendered in the footer", 4000);
+    pumpFor(100); captureWindow(process.window, L"ui-smoke-waveform.bmp");
     key(list, VK_END);
-    waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) == 15; }, "End did not select the final file");
+    waitFor([&] { return SendMessageW(list, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED) == kFixtureCount - 1; }, "End did not select the final file");
     key(list, VK_SPACE); key(list, VK_SPACE);
 
-    // Previously selected index15 must not be used against the new empty model.
+    // Previously selected final index must not be used against the new empty model.
     openByEnter(process, path, list, empty, 0);
-    openByEnter(process, path, list, audio, 16);
+    openByEnter(process, path, list, audio, kFixtureCount);
 
     // All fixture files start unassigned. Its checkbox must hide/reveal all rows.
     HWND unassigned = GetDlgItem(process.window, kFilter);
@@ -237,7 +463,7 @@ int run(const std::filesystem::path& executable) {
     SendMessageW(unassigned, BM_CLICK, 0, 0);
     waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 0; }, "Unassigned filter did not hide files");
     SendMessageW(unassigned, BM_CLICK, 0, 0);
-    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; }, "Unassigned filter did not restore files");
+    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == kFixtureCount; }, "Unassigned filter did not restore files");
 
     // Assign Red by clicking the real popup item through the native input route.
     focusControl(process.window, list); key(list, VK_DOWN);
@@ -273,8 +499,28 @@ int run(const std::filesystem::path& executable) {
     RedrawWindow(process.window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     captureWindow(process.window, L"ui-smoke-category.bmp");
     SendMessageW(unassigned, BM_CLICK, 0, 0);
-    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 16; },
+    waitFor([&] { return SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == kFixtureCount; },
             "Assigned and unassigned files did not restore together");
+
+    HWND vertical = nullptr;
+    waitFor([&] { vertical = childControl(process.window, kVerticalRail); return vertical && IsWindowVisible(vertical); },
+            "Custom vertical scrollbar is missing");
+    HWND smooth = childControl(process.window, 0x6A13);
+    require(smooth != nullptr, "Smooth-scroll compositor is missing");
+    SendMessageW(list, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), 0);
+    require(IsWindowVisible(smooth), "Wheel scrolling did not start the smooth compositor");
+    captureWindow(process.window, L"ui-smoke-smooth-scroll.bmp");
+    waitFor([&] { return !IsWindowVisible(smooth); }, "Smooth-scroll compositor did not settle", 2000);
+    require(SendMessageW(list, LVM_GETTOPINDEX, 0, 0) > 0, "Wheel scroll did not change the file list position");
+    RECT verticalRect{}; GetWindowRect(vertical, &verticalRect);
+    require(verticalRect.right - verticalRect.left <= MulDiv(10, dpi, 96), "Vertical scrollbar is not slim");
+    clickScreen({(verticalRect.left + verticalRect.right) / 2,
+                 verticalRect.top + (verticalRect.bottom - verticalRect.top) * 4 / 5});
+    waitFor([&] { return SendMessageW(list, LVM_GETTOPINDEX, 0, 0) > 0; }, "Custom vertical scrollbar did not move the file list");
+    captureWindow(process.window, L"ui-smoke-vertical-scroll.bmp");
+    testFileDrag(process, list, audio / L"take1.wav");
+    const auto moved = root / L"Moved file \u65e5\u672c\u8a9e.wav";
+    testFileDrag(process, list, audio / L"take1.wav", DROPEFFECT_MOVE, moved);
 
     // Exercise native header clicks and resizable columns on the shipped control.
     const int catWidth = static_cast<int>(SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0));
@@ -290,6 +536,15 @@ int run(const std::filesystem::path& executable) {
     require(process.alive(), "App exited during list interactions");
     RedrawWindow(process.window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     captureWindow(process.window, L"ui-smoke-narrow.bmp");
+    HWND horizontal = nullptr;
+    waitFor([&] { horizontal = childControl(process.window, kHorizontalRail); return horizontal && IsWindowVisible(horizontal); },
+            "Custom horizontal scrollbar is missing at narrow width");
+    RECT horizontalRect{}; GetWindowRect(horizontal, &horizontalRect);
+    require(horizontalRect.bottom - horizontalRect.top <= MulDiv(10, dpi, 96), "Horizontal scrollbar is not slim");
+    clickScreen({horizontalRect.left + (horizontalRect.right - horizontalRect.left) * 4 / 5,
+                 (horizontalRect.top + horizontalRect.bottom) / 2});
+    waitFor([&] { return GetScrollPos(list, SB_HORZ) > 0; }, "Custom horizontal scrollbar did not move the columns");
+    captureWindow(process.window, L"ui-smoke-horizontal-scroll.bmp");
 
     PostMessageW(process.window, WM_CLOSE, 0, 0);
     require(WaitForSingleObject(process.info.hProcess, 8000) == WAIT_OBJECT_0, "App did not exit cleanly");
@@ -302,20 +557,28 @@ int run(const std::filesystem::path& executable) {
     require(saved.find("S col1 ") != std::string::npos, "Column width was not remembered");
     require(saved.find("S ascending 0") != std::string::npos, "Header click did not reverse the filename sort");
     require(saved.find("C 1 ") != std::string::npos, "Red file category was not persisted");
+    const auto volumeStart = saved.find("S volume ");
+    require(volumeStart != std::string::npos, "Volume setting was not saved");
+    std::istringstream volumeSetting(saved.substr(volumeStart + 9)); float savedVolume = 0;
+    volumeSetting >> savedVolume;
+    require(savedVolume >= 0.71f && savedVolume <= 0.79f, "Clicked volume position was not persisted");
     for (const auto& file : std::filesystem::directory_iterator(audio))
         require(file.path().extension() == L".wav", "App wrote metadata into the audio folder");
-    std::cout << "UI smoke passed: Unicode paths, Enter, selection, empty folder, filters, category menu, sorting, resizing, persistence, clean exit.\n";
+    std::cout << "UI smoke passed: Unicode paths, Enter, selection, empty folder, filters, category menu, compact path, waveform capture, click-volume, slim scrolling, native file drag, sorting, resizing, persistence, clean exit.\n";
     return 0;
 }
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const HRESULT initialized = OleInitialize(nullptr);
+    if (FAILED(initialized)) { std::cerr << "Could not initialize native drop test.\n"; return 1; }
+    int result = 1;
     try {
         require(argc == 2, "Usage: abser_ui_smoke.exe <Abser.exe>");
-        return run(std::filesystem::absolute(argv[1]));
+        result = run(std::filesystem::absolute(argv[1]));
     } catch (const std::exception& error) {
         std::cerr << "UI smoke failed: " << error.what() << '\n';
-        return 1;
     }
+    OleUninitialize(); return result;
 }

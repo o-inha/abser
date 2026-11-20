@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace abser {
 
@@ -14,6 +15,15 @@ struct AudioSnapshot {
     AudioState state = AudioState::Stopped;
     double durationSeconds = -1.0;
     double positionSeconds = 0.0;
+};
+
+struct WaveformSnapshot {
+    std::wstring path;
+    // 512 linear, absolute peak amplitudes, from 0 to 1. Mirror around the
+    // centre line when drawing. Empty while loading or for unreadable files.
+    std::vector<float> peaks;
+    double durationSeconds = -1.0;
+    bool loading = false;
 };
 
 // One persistent output device; opening and decoding files happens on a worker.
@@ -34,6 +44,8 @@ public:
     void stop();
     void setVolume(float volume);
     AudioSnapshot snapshot() const;
+    // Copies a tiny completed waveform; never performs file access or decoding.
+    WaveformSnapshot waveformSnapshot() const;
 
 private:
     struct Impl;

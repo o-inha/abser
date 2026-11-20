@@ -29,12 +29,15 @@
 #include <vector>
 #include "audio.h"
 #include "catalog.h"
+#include "file_drag.h"
+#include "slim_scrollbars.h"
 
 namespace {
 using namespace abser;
 constexpr UINT WM_SCAN = WM_APP + 1, WM_DURATION = WM_APP + 2, WM_AUDIO = WM_APP + 3, WM_AUDIO_READY = WM_APP + 4;
 constexpr UINT TIMER_UI = 1, TIMER_SAVE = 2;
 constexpr int ID_PATH = 101, ID_OPEN = 102, ID_LIST = 103, ID_VOLUME = 104, ID_PLAY = 105, ID_FILTER = 200;
+constexpr int LIST_TOP = 72, FOOTER_HEIGHT = 152;
 const COLORREF BG = RGB(23,25,28), PANEL = RGB(29,32,36), TEXT = RGB(228,231,234), MUTED = RGB(146,153,161), LINE = RGB(48,53,58), ACCENT = RGB(195,219,164), SELECTED = RGB(48,60,56);
 const COLORREF COLORS[11] = {RGB(146,153,161),RGB(235,107,111),RGB(235,159,91),RGB(224,202,100),RGB(155,202,113),RGB(92,194,159),RGB(92,190,208),RGB(110,150,224),RGB(164,132,220),RGB(213,129,192),RGB(207,188,163)};
 const wchar_t* COLOR_NAMES[11] = {L"Unassigned",L"Red",L"Orange",L"Yellow",L"Lime",L"Green",L"Cyan",L"Blue",L"Violet",L"Pink",L"Sand"};
@@ -83,17 +86,20 @@ struct App {
     HWND window{}, path{}, open{}, list{}, volume{}, play{}, tooltip{}, filters[11]{};
     HFONT font{}, smallFont{}; HBRUSH bgBrush{}, panelBrush{}; HIMAGELIST rowImages{};
     UINT dpi = 96; MetadataStore store; AudioEngine audio; std::unique_ptr<FolderWorker> worker;
+    SlimScrollbars scrollbars;
     std::thread audioInit; bool audioReady = false, audioStarting = true, smokeTest = false, queuedPaused = false; std::wstring queuedPlay;
     std::vector<FileEntry> files; std::vector<size_t> visible;
     std::unordered_map<std::wstring,size_t> fileIndex;
     uint64_t generation = 0; bool suppressSelection = false, ready = false, loading = false, closing = false;
-    bool durationSortDirty = false; std::wstring folder, notice; AudioSnapshot playback;
+    bool durationSortDirty = false; std::wstring folder, notice; AudioSnapshot playback; WaveformSnapshot waveform;
+    uint64_t dragSerial = 0;
     std::wstring savedSelection; std::chrono::steady_clock::time_point selectionChanged{};
     int scale(int value) const { return MulDiv(value,static_cast<int>(dpi),96); }
     int logical(int value) const { return MulDiv(value,96,static_cast<int>(dpi)); }
     int selected() const { return ListView_GetNextItem(list,-1,LVNI_SELECTED); }
     const FileEntry* entry(int row) const { return row >= 0 && static_cast<size_t>(row) < visible.size() && visible[row]<files.size() ? &files[visible[row]] : nullptr; }
     void dirty() { if (!closing) SetTimer(window,TIMER_SAVE,500,nullptr); }
+    void invalidateTransport() { RECT r{};GetClientRect(window,&r);r.top=std::max(0L,r.bottom-scale(FOOTER_HEIGHT));r.bottom-=scale(44);InvalidateRect(window,&r,FALSE); }
     void save() {
         if (!ready) return;
         for (int i=0;i<4;++i) store.settings.columnWidths[i] = logical(ListView_GetColumnWidth(list,i));
@@ -119,12 +125,12 @@ struct App {
         for(size_t i=0;i<files.size();++i) if(store.settings.categoryMask & (1u<<files[i].category)) visible.push_back(i);
         ListView_SetItemCountEx(list,static_cast<int>(visible.size()),LVSICF_NOSCROLL|LVSICF_NOINVALIDATEALL);
         for(size_t i=0;i<visible.size();++i) if(files[visible[i]].path==selectedPath) { ListView_SetItemState(list,static_cast<int>(i),LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED); ListView_EnsureVisible(list,static_cast<int>(i),FALSE); break; }
-        suppressSelection=false; headerSort(); InvalidateRect(list,nullptr,FALSE); InvalidateRect(window,nullptr,FALSE);
+        suppressSelection=false; headerSort(); scrollbars.refresh();InvalidateRect(list,nullptr,FALSE); InvalidateRect(window,nullptr,FALSE);
     }
     void playRow(int row) {
         if (auto e=entry(row)) { notice.clear(); selectionChanged=std::chrono::steady_clock::now();
             if(audioStarting) {queuedPlay=e->path;queuedPaused=false;playback={e->path,L"",AudioState::Loading,-1.0,0.0};} else audio.play(e->path);
-            InvalidateRect(window,nullptr,FALSE); }
+            invalidateTransport(); }
     }
     void navigate(int step) {
         if(visible.empty()) return; int row=selected(); row = row<0 ? (step<0?static_cast<int>(visible.size())-1:0) : std::clamp(row+step,0,static_cast<int>(visible.size())-1);
@@ -163,7 +169,22 @@ struct App {
         SetFocus(list);
     }
     void categoryForSelection() { int row=selected(); if(row<0) return; RECT r{}; ListView_GetSubItemRect(list,row,0,LVIR_BOUNDS,&r); POINT p{r.left,r.bottom}; ClientToScreen(list,&p); assignCategory(row,p); }
-    void updateAudio() { if(!audioStarting||queuedPlay.empty())playback=audio.snapshot(); InvalidateRect(window,nullptr,FALSE); InvalidateRect(play,nullptr,FALSE); }
+    void beginDrag(int row) {
+        const auto* file=entry(row);if(!file)return;const std::wstring value=file->path;++dragSerial;
+        auto result=dragFile(window,value);
+        if(FAILED(result.result)) {notice=L"Could not drag this file.";invalidateTransport();}
+        if(((result.effect&DROPEFFECT_MOVE)!=0||result.sourceRemoved)&&!folder.empty())load(folder);
+    }
+    void updateAudio() {
+        const auto before=playback;
+        if(!audioStarting||queuedPlay.empty())playback=audio.snapshot();
+        auto next=audio.waveformSnapshot();
+        const bool changed=next.path!=waveform.path||next.loading!=waveform.loading||next.peaks!=waveform.peaks;
+        waveform=std::move(next);
+        if(waveform.path==playback.path&&waveform.durationSeconds>0&&playback.durationSeconds<0)playback.durationSeconds=waveform.durationSeconds;
+        if(changed||before.state!=playback.state||before.path!=playback.path||before.error!=playback.error||before.durationSeconds!=playback.durationSeconds||std::abs(before.positionSeconds-playback.positionSeconds)>0.0005)invalidateTransport();
+        if(before.state!=playback.state)InvalidateRect(play,nullptr,FALSE);
+    }
 };
 App* app = nullptr;
 
@@ -175,6 +196,14 @@ void swatch(HDC dc,RECT r,int category,bool enabled=true) {
     auto ob=SelectObject(dc,brush); auto op=SelectObject(dc,pen); RoundRect(dc,r.left,r.top,r.right,r.bottom,3,3); SelectObject(dc,op); SelectObject(dc,ob); DeleteObject(pen); if(category) DeleteObject(brush);
 }
 void textDraw(HDC dc,const std::wstring& text,RECT rect,COLORREF color,UINT flags=DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS) { SetBkMode(dc,TRANSPARENT); SetTextColor(dc,color); DrawTextW(dc,text.c_str(),static_cast<int>(text.size()),&rect,flags); }
+template<class Draw> void bufferedPaint(HDC target,const RECT& area,Draw draw) {
+    const int width=area.right-area.left,height=area.bottom-area.top;if(width<=0||height<=0)return;
+    HDC memory=CreateCompatibleDC(target);HBITMAP bitmap=CreateCompatibleBitmap(target,width,height);
+    if(!memory||!bitmap) {if(bitmap)DeleteObject(bitmap);if(memory)DeleteDC(memory);draw(target);return;}
+    auto old=SelectObject(memory,bitmap);SetWindowOrgEx(memory,area.left,area.top,nullptr);draw(memory);
+    BitBlt(target,area.left,area.top,width,height,memory,area.left,area.top,SRCCOPY);
+    SelectObject(memory,old);DeleteObject(bitmap);DeleteDC(memory);
+}
 std::wstring durationText(double seconds) {
     if(seconds<0 || !std::isfinite(seconds)) return L"\u2014";
     if(seconds<10.0) {wchar_t value[32];swprintf(value,32,seconds<1.0?L"%.3fs":L"%.2fs",seconds);return value;}
@@ -196,6 +225,41 @@ LRESULT CALLBACK PathProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
     if(message==WM_KEYDOWN && wParam==VK_ESCAPE) { SetWindowTextW(hwnd,app->folder.c_str()); SetFocus(app->list); return 0; }
     return DefSubclassProc(hwnd,message,wParam,lParam);
 }
+LRESULT CALLBACK ButtonProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    return DefSubclassProc(hwnd,message,wParam,lParam);
+}
+RECT volumeChannel(HWND hwnd) {
+    RECT r{};SendMessageW(hwnd,TBM_GETCHANNELRECT,0,reinterpret_cast<LPARAM>(&r));
+    RECT client{};GetClientRect(hwnd,&client);
+    if(r.right<=r.left) {r.left=app->scale(6);r.right=client.right-app->scale(6);}
+    return r;
+}
+void volumeAt(HWND hwnd,int x,UINT event=TB_THUMBTRACK) {
+    const RECT channel=volumeChannel(hwnd);const int position=std::clamp(MulDiv(x-channel.left,100,std::max(1L,channel.right-channel.left)),0,100);
+    SendMessageW(hwnd,TBM_SETPOS,TRUE,position);InvalidateRect(hwnd,nullptr,FALSE);
+    SendMessageW(app->window,WM_HSCROLL,MAKEWPARAM(event,position),reinterpret_cast<LPARAM>(hwnd));
+}
+void paintVolume(HWND hwnd,HDC dc) {
+    RECT r{};GetClientRect(hwnd,&r);fill(dc,r,BG);const auto channel=volumeChannel(hwnd);
+    const int value=static_cast<int>(SendMessageW(hwnd,TBM_GETPOS,0,0)),y=(r.top+r.bottom)/2;
+    const int x=channel.left+MulDiv(value,channel.right-channel.left,100);
+    line(dc,channel.left,y,channel.right,y,LINE,app->scale(3));line(dc,channel.left,y,x,y,ACCENT,app->scale(2));
+    RECT thumb{x-app->scale(4),y-app->scale(7),x+app->scale(4),y+app->scale(7)};
+    HBRUSH brush=CreateSolidBrush(ACCENT);auto oldBrush=SelectObject(dc,brush);auto oldPen=SelectObject(dc,GetStockObject(NULL_PEN));
+    RoundRect(dc,thumb.left,thumb.top,thumb.right,thumb.bottom,app->scale(3),app->scale(3));SelectObject(dc,oldPen);SelectObject(dc,oldBrush);DeleteObject(brush);
+    if(GetFocus()==hwnd) {RECT focus=r;InflateRect(&focus,-1,-1);DrawFocusRect(dc,&focus);}
+}
+LRESULT CALLBACK VolumeProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT) {PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);bufferedPaint(dc,ps.rcPaint,[&](HDC memory){paintVolume(hwnd,memory);});EndPaint(hwnd,&ps);return 0;}
+    if(message==WM_PRINTCLIENT) {paintVolume(hwnd,reinterpret_cast<HDC>(wParam));return 0;}
+    if(message==WM_LBUTTONDOWN) {SetFocus(hwnd);SetCapture(hwnd);volumeAt(hwnd,GET_X_LPARAM(lParam));return 0;}
+    if(message==WM_MOUSEMOVE&&GetCapture()==hwnd) {volumeAt(hwnd,GET_X_LPARAM(lParam));return 0;}
+    if(message==WM_LBUTTONUP&&GetCapture()==hwnd) {volumeAt(hwnd,GET_X_LPARAM(lParam),TB_ENDTRACK);ReleaseCapture();return 0;}
+    if(message==WM_SETFOCUS||message==WM_KILLFOCUS)InvalidateRect(hwnd,nullptr,FALSE);
+    return DefSubclassProc(hwnd,message,wParam,lParam);
+}
 void paintHeader(HWND hwnd,HDC dc) {
     RECT client{};GetClientRect(hwnd,&client);fill(dc,client,BG);SelectObject(dc,app->smallFont);
     for(int i=0;i<4;++i) {
@@ -209,7 +273,7 @@ void paintHeader(HWND hwnd,HDC dc) {
 }
 LRESULT CALLBACK HeaderProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR) {
     if(message==WM_ERASEBKGND)return 1;
-    if(message==WM_PAINT){PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);paintHeader(hwnd,dc);EndPaint(hwnd,&ps);return 0;}
+    if(message==WM_PAINT){PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);bufferedPaint(dc,ps.rcPaint,[&](HDC memory){paintHeader(hwnd,memory);});EndPaint(hwnd,&ps);return 0;}
     if(message==WM_PRINTCLIENT){paintHeader(hwnd,reinterpret_cast<HDC>(wParam));return 0;}
     return DefSubclassProc(hwnd,message,wParam,lParam);
 }
@@ -222,8 +286,8 @@ LRESULT CALLBACK ListProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam,UIN
     if(message==WM_LBUTTONDOWN) {
         LVHITTESTINFO hit{}; hit.pt={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)}; ListView_SubItemHitTest(hwnd,&hit);
         if(hit.iItem>=0 && hit.iSubItem==0) { POINT point=hit.pt; ClientToScreen(hwnd,&point); app->assignCategory(hit.iItem,point); return 0; }
-        bool same=hit.iItem>=0 && app->selected()==hit.iItem; LRESULT result=DefSubclassProc(hwnd,message,wParam,lParam);
-        if(same) app->playRow(hit.iItem); return result;
+        bool same=hit.iItem>=0 && app->selected()==hit.iItem;const auto serial=app->dragSerial;LRESULT result=DefSubclassProc(hwnd,message,wParam,lParam);
+        if(same&&serial==app->dragSerial) app->playRow(hit.iItem); return result;
     }
     if(message==WM_CONTEXTMENU) {
         POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
@@ -242,17 +306,18 @@ void setFonts(App& a) {
     a.rowImages=ImageList_Create(1,a.scale(29),ILC_COLOR32,1,1); ListView_SetImageList(a.list,a.rowImages,LVSIL_SMALL);
 }
 void layout(App& a) {
-    RECT r{}; GetClientRect(a.window,&r); int w=r.right,h=r.bottom, p=a.scale(10), top=a.scale(10), bh=a.scale(32);
-    MoveWindow(a.path,p,top,std::max(a.scale(60),w-3*p-bh),bh,TRUE); MoveWindow(a.open,w-p-bh,top,bh,bh,TRUE);
-    const int y=a.scale(51), available=w-2*p, cell=std::min(a.scale(27),available/11);
+    RECT r{}; GetClientRect(a.window,&r); int w=r.right,h=r.bottom, p=a.scale(10), top=a.scale(8), bh=a.scale(24);
+    const int pathWidth=std::max(a.scale(60),w-3*p-bh);
+    MoveWindow(a.path,p+a.scale(6),top+a.scale(4),pathWidth-a.scale(12),a.scale(16),TRUE); MoveWindow(a.open,w-p-bh,top,bh,bh,TRUE);
+    const int y=a.scale(38), available=w-2*p, cell=std::min(a.scale(27),available/11);
     for(int i=0;i<11;++i) MoveWindow(a.filters[i],p+i*cell,y,cell-1,a.scale(26),TRUE);
-    const int listTop=a.scale(86), bottom=a.scale(84);
-    MoveWindow(a.list,0,listTop,w,std::max(a.scale(50),h-listTop-bottom),TRUE);
-    MoveWindow(a.play,p,h-a.scale(72),a.scale(26),a.scale(27),TRUE);
+    const int listTop=a.scale(LIST_TOP), bottom=a.scale(FOOTER_HEIGHT);
+    RECT listArea{0,listTop,w,std::max(listTop+a.scale(50),h-bottom)};a.scrollbars.layout(listArea,a.dpi);
+    MoveWindow(a.play,p,h-a.scale(88),a.scale(26),a.scale(30),TRUE);
     MoveWindow(a.volume,p+a.scale(27),h-a.scale(36),std::max(a.scale(40),w-2*p-a.scale(71)),a.scale(24),TRUE);
-    InvalidateRect(a.window,nullptr,TRUE);
+    InvalidateRect(a.window,nullptr,FALSE);
 }
-void drawButton(const DRAWITEMSTRUCT& d) {
+void drawButtonContent(const DRAWITEMSTRUCT& d) {
     App& a=*app; HDC dc=d.hDC; RECT r=d.rcItem; bool pressed=(d.itemState&ODS_SELECTED)!=0,focused=(d.itemState&ODS_FOCUS)!=0;
     fill(dc,r,pressed?SELECTED:BG);
     if(d.CtlID>=ID_FILTER && d.CtlID<ID_FILTER+11) {
@@ -271,11 +336,39 @@ void drawButton(const DRAWITEMSTRUCT& d) {
     }
     if(focused) { RECT f=r; InflateRect(&f,-1,-1); DrawFocusRect(dc,&f); }
 }
+void drawButton(const DRAWITEMSTRUCT& d) {
+    bufferedPaint(d.hDC,d.rcItem,[&](HDC memory){auto item=d;item.hDC=memory;drawButtonContent(item);});
+}
+void paintWaveform(App& a,HDC dc,const RECT& area) {
+    fill(dc,area,PANEL);
+    const int width=area.right-area.left,middle=(area.top+area.bottom)/2,half=(area.bottom-area.top)/2-a.scale(4);
+    if(width<=0||half<=0)return;
+    line(dc,area.left,middle,area.right,middle,LINE);
+    const bool matching=a.waveform.path==a.playback.path&&!a.playback.path.empty();
+    double duration=a.playback.durationSeconds;
+    if(matching&&a.waveform.durationSeconds>0)duration=a.waveform.durationSeconds;
+    const double progress=duration>0?std::clamp(a.playback.positionSeconds/duration,0.0,1.0):0.0;
+    const int playhead=area.left+static_cast<int>(std::round(progress*std::max(0,width-1)));
+    if(matching&&!a.waveform.peaks.empty()) {
+        const auto& peaks=a.waveform.peaks;const float maximum=*std::max_element(peaks.begin(),peaks.end());
+        const float displayGain=maximum>0?1.0f/maximum:1.0f;
+        for(int x=0;x<width;++x) {
+            size_t first=static_cast<size_t>(x)*peaks.size()/width,last=std::min(peaks.size(),std::max(first+1,static_cast<size_t>(x+1)*peaks.size()/width));
+            float peak=0;for(size_t i=first;i<last;++i)peak=std::max(peak,peaks[i]);
+            const int height=std::max(1,static_cast<int>(std::round(std::clamp(peak*displayGain,0.0f,1.0f)*half)));
+            line(dc,area.left+x,middle-height,area.left+x,middle+height+1,area.left+x<playhead?ACCENT:RGB(105,119,126));
+        }
+    }
+    if(!a.playback.path.empty())line(dc,playhead,area.top+a.scale(2),playhead,area.bottom-a.scale(2),TEXT);
+}
 void paint(App& a,HDC dc) {
     RECT r{};GetClientRect(a.window,&r); fill(dc,r,BG); SelectObject(dc,a.smallFont);
-    int w=r.right,h=r.bottom,p=a.scale(10); line(dc,0,a.scale(83),w,a.scale(83),LINE);
-    line(dc,0,h-a.scale(84),w,h-a.scale(84),LINE);
-    RECT now{p+a.scale(34),h-a.scale(73),w-p,h-a.scale(52)};
+    int w=r.right,h=r.bottom,p=a.scale(10);
+    RECT field{p,a.scale(8),w-2*p-a.scale(24),a.scale(32)};fill(dc,field,PANEL);
+    line(dc,0,a.scale(LIST_TOP-3),w,a.scale(LIST_TOP-3),LINE);
+    line(dc,0,h-a.scale(FOOTER_HEIGHT),w,h-a.scale(FOOTER_HEIGHT),LINE);
+    RECT wave{p,h-a.scale(144),w-p,h-a.scale(98)};paintWaveform(a,dc,wave);
+    RECT now{p+a.scale(34),h-a.scale(89),w-p,h-a.scale(68)};
     std::wstring name,detail;
     if(!a.notice.empty()) { name=a.notice; detail=L""; }
     else if(a.playback.state==AudioState::Error) { name=L"Cannot play this file"; detail=a.playback.error; }
@@ -283,18 +376,13 @@ void paint(App& a,HDC dc) {
         const wchar_t* state=L"Stopped"; switch(a.playback.state) { case AudioState::Loading:state=L"Opening";break;case AudioState::Playing:state=L"Playing";break;case AudioState::Paused:state=L"Paused";break;case AudioState::Finished:state=L"Finished";break;default:break; }
         detail=std::wstring(state)+L"  "+durationText(a.playback.positionSeconds)+L" / "+durationText(a.playback.durationSeconds);
     } else { name=a.loading?L"Opening folder\u2026":L"Click a file to listen"; detail=L"\u2191 \u2193  Browse     Space  Pause / play"; }
-    textDraw(dc,name,now,TEXT); RECT status{p+a.scale(34),h-a.scale(53),w-p,h-a.scale(38)};
+    textDraw(dc,name,now,TEXT); RECT status{p+a.scale(34),h-a.scale(69),w-p,h-a.scale(52)};
     textDraw(dc,detail,status,MUTED);
     RECT vol{w-p-a.scale(39),h-a.scale(36),w-p,h-a.scale(12)}; textDraw(dc,std::to_wstring(static_cast<int>(std::round(a.store.settings.volume*100)))+L"%",vol,MUTED,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
     // Small speaker icon.
     int sx=p+a.scale(6),sy=h-a.scale(24); RECT speaker{sx-a.scale(3),sy-a.scale(3),sx,sy+a.scale(3)}; fill(dc,speaker,MUTED);
     POINT speakerPts[4]{{sx,sy-a.scale(3)},{sx+a.scale(5),sy-a.scale(7)},{sx+a.scale(5),sy+a.scale(7)},{sx,sy+a.scale(3)}};
     HBRUSH b=CreateSolidBrush(MUTED); auto old=SelectObject(dc,b); auto pen=SelectObject(dc,GetStockObject(NULL_PEN)); Polygon(dc,speakerPts,4);SelectObject(dc,pen);SelectObject(dc,old);DeleteObject(b);
-    if(a.visible.empty() && !a.loading) {
-        RECT empty{p,a.scale(130),w-p,h-a.scale(110)};
-        std::wstring msg=a.folder.empty()?L"Open an audio folder\n\nPaste a path above and press Enter,\nor click the folder button.":a.files.empty()?L"No audio files in this folder":L"No files match the selected colours";
-        textDraw(dc,msg,empty,MUTED,DT_CENTER|DT_TOP|DT_WORDBREAK);
-    }
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) {
@@ -303,7 +391,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
     case WM_CREATE: {
         a->window=hwnd; a->dpi=GetDpiForWindow(hwnd); a->bgBrush=CreateSolidBrush(BG);a->panelBrush=CreateSolidBrush(PANEL);
         BOOL dark=TRUE; DwmSetWindowAttribute(hwnd,20,&dark,sizeof(dark));
-        a->path=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PATH)),nullptr,nullptr);
+        a->path=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PATH)),nullptr,nullptr);
         SendMessageW(a->path,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Folder path")); SetWindowSubclass(a->path,PathProc,1,0);
         a->open=CreateWindowW(L"BUTTON",L"Open folder",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_OPEN)),nullptr,nullptr);
         a->list=CreateWindowW(WC_LISTVIEWW,L"Audio files",WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LIST)),nullptr,nullptr);
@@ -318,15 +406,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
         a->play=CreateWindowW(L"BUTTON",L"Play / pause",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_PLAY)),nullptr,nullptr);
         a->volume=CreateWindowW(TRACKBAR_CLASSW,L"Volume",WS_CHILD|WS_VISIBLE|WS_TABSTOP|TBS_HORZ|TBS_NOTICKS,0,0,0,0,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_VOLUME)),nullptr,nullptr);
         SendMessageW(a->volume,TBM_SETRANGE,TRUE,MAKELPARAM(0,100));SendMessageW(a->volume,TBM_SETPOS,TRUE,static_cast<int>(a->store.settings.volume*100));
-        SendMessageW(a->volume,TBM_SETPAGESIZE,0,5);SetWindowTheme(a->volume,L"",L"");
+        SendMessageW(a->volume,TBM_SETPAGESIZE,0,5);SetWindowTheme(a->volume,L"",L"");SetWindowSubclass(a->volume,VolumeProc,1,0);
+        for(HWND child:{a->open,a->play})SetWindowSubclass(child,ButtonProc,1,0);
+        for(HWND child:a->filters)SetWindowSubclass(child,ButtonProc,1,0);
         a->tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,nullptr,nullptr);
         tooltip(hwnd,a->open,L"Open folder (Ctrl+O)");tooltip(hwnd,a->play,L"Play / pause (Space)");tooltip(hwnd,a->path,L"Paste a folder path and press Enter. Ctrl+L to focus.");
         for(int i=0;i<11;++i) tooltip(hwnd,a->filters[i],COLOR_NAMES[i]);
-        setFonts(*a);layout(*a);a->headerSort();DragAcceptFiles(hwnd,TRUE);
+        setFonts(*a);a->scrollbars.attach(a->list,hwnd);layout(*a);a->headerSort();DragAcceptFiles(hwnd,TRUE);
         a->worker=std::make_unique<FolderWorker>(hwnd);a->audio.setNotify([hwnd]{PostMessageW(hwnd,WM_AUDIO,0,0);});
         a->audio.setVolume(a->store.settings.volume);
         a->audioInit=std::thread([a,hwnd]{bool success=a->audio.initialize(a->smokeTest);PostMessageW(hwnd,WM_AUDIO_READY,success?1:0,0);});
-        a->ready=true;SetTimer(hwnd,TIMER_UI,100,nullptr);
+        a->ready=true;SetTimer(hwnd,TIMER_UI,33,nullptr);
         if(!a->store.settings.lastFolder.empty()) {SetWindowTextW(a->path,a->store.settings.lastFolder.c_str());a->load(a->store.settings.lastFolder);}
         return 0;
     }
@@ -345,7 +435,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
             SendMessageW(a->filters[i],BM_SETCHECK,(a->store.settings.categoryMask&(1u<<i))?BST_CHECKED:BST_UNCHECKED,0);InvalidateRect(a->filters[i],nullptr,FALSE);a->rebuild(false);a->dirty();return 0;}
         return 0;
     }
-    case WM_HSCROLL: if(reinterpret_cast<HWND>(lParam)==a->volume) {a->store.settings.volume=static_cast<float>(SendMessageW(a->volume,TBM_GETPOS,0,0))/100.f;a->audio.setVolume(a->store.settings.volume);a->dirty();InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+    case WM_HSCROLL: if(reinterpret_cast<HWND>(lParam)==a->volume) {a->store.settings.volume=static_cast<float>(SendMessageW(a->volume,TBM_GETPOS,0,0))/100.f;a->audio.setVolume(a->store.settings.volume);a->dirty();RECT changed{};GetClientRect(hwnd,&changed);changed.top=changed.bottom-a->scale(42);InvalidateRect(hwnd,&changed,FALSE);}return 0;
     case WM_NOTIFY: {
         auto hdr=reinterpret_cast<NMHDR*>(lParam);
         if(hdr->hwndFrom==a->list) {
@@ -355,6 +445,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
                     lstrcpynW(info->item.pszText,text.c_str(),info->item.cchTextMax);}return 0;}
             case LVN_GETINFOTIPW: {auto tip=reinterpret_cast<NMLVGETINFOTIPW*>(lParam);if(auto e=a->entry(tip->iItem)){std::wstring value=e->name+L"\n"+COLOR_NAMES[e->category]+L"  \u00b7  "+durationText(e->duration)+L"\nModified: "+modifiedText(e->modified);lstrcpynW(tip->pszText,value.c_str(),tip->cchTextMax);}return 0;}
             case LVN_ITEMCHANGED: {auto change=reinterpret_cast<NMLISTVIEW*>(lParam);if(!a->suppressSelection&&(change->uChanged&LVIF_STATE)&&(change->uNewState&LVIS_SELECTED)&&!(change->uOldState&LVIS_SELECTED))a->playRow(change->iItem);return 0;}
+            case LVN_BEGINDRAG: {auto drag=reinterpret_cast<NMLISTVIEW*>(lParam);a->beginDrag(drag->iItem);return 0;}
             case LVN_COLUMNCLICK: {auto click=reinterpret_cast<NMLISTVIEW*>(lParam);auto col=static_cast<SortColumn>(click->iSubItem);if(col==a->store.settings.sortColumn)a->store.settings.ascending=!a->store.settings.ascending;else{a->store.settings.sortColumn=col;a->store.settings.ascending=true;}a->rebuild();a->dirty();return 0;}
             case NM_CUSTOMDRAW: {
                 auto cd=reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
@@ -378,13 +469,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
             }
         }
         if(hdr->hwndFrom==ListView_GetHeader(a->list)) {
-            if(hdr->code==HDN_ENDTRACKW||hdr->code==HDN_ENDTRACKA){a->dirty();return 0;}
+            if(hdr->code==HDN_ENDTRACKW||hdr->code==HDN_ENDTRACKA){a->scrollbars.refresh();a->dirty();return 0;}
             if(hdr->code==NM_CUSTOMDRAW) {auto cd=reinterpret_cast<NMCUSTOMDRAW*>(lParam);if(cd->dwDrawStage==CDDS_PREPAINT){RECT r{};GetClientRect(hdr->hwndFrom,&r);fill(cd->hdc,r,BG);return CDRF_NOTIFYITEMDRAW;}
                 if(cd->dwDrawStage==CDDS_ITEMPREPAINT){RECT r=cd->rc;fill(cd->hdc,r,BG);SelectObject(cd->hdc,a->smallFont);int i=static_cast<int>(cd->dwItemSpec);wchar_t label[64]{};HDITEMW item{};item.mask=HDI_TEXT;item.pszText=label;item.cchTextMax=64;Header_GetItem(hdr->hwndFrom,i,&item);
                     r.left+=a->scale(8);r.right-=a->scale(5);std::wstring text=label;if(i==static_cast<int>(a->store.settings.sortColumn))text+=a->store.settings.ascending?L" \u2191":L" \u2193";textDraw(cd->hdc,text,r,MUTED);line(cd->hdc,cd->rc.right-1,cd->rc.top+a->scale(7),cd->rc.right-1,cd->rc.bottom-a->scale(7),LINE);return CDRF_SKIPDEFAULT;}}
         }
-        if(hdr->hwndFrom==a->volume&&hdr->code==NM_CUSTOMDRAW){auto cd=reinterpret_cast<NMCUSTOMDRAW*>(lParam);if(cd->dwDrawStage==CDDS_PREPAINT)return CDRF_NOTIFYITEMDRAW;
-            if(cd->dwDrawStage==CDDS_ITEMPREPAINT){if(cd->dwItemSpec==TBCD_CHANNEL){RECT r=cd->rc;r.top=(r.top+r.bottom)/2-a->scale(1);r.bottom=r.top+a->scale(3);fill(cd->hdc,r,LINE);return CDRF_SKIPDEFAULT;}if(cd->dwItemSpec==TBCD_THUMB){RECT r=cd->rc;fill(cd->hdc,r,ACCENT);return CDRF_SKIPDEFAULT;}}}
         return 0;
     }
     case WM_DRAWITEM: {auto d=reinterpret_cast<DRAWITEMSTRUCT*>(lParam);if(d->CtlType==ODT_MENU) {int i=static_cast<int>(d->itemData);fill(d->hDC,d->rcItem,(d->itemState&ODS_SELECTED)?SELECTED:BG);RECT s{d->rcItem.left+a->scale(10),d->rcItem.top+a->scale(7),d->rcItem.left+a->scale(23),d->rcItem.top+a->scale(20)};swatch(d->hDC,s,i);RECT text=d->rcItem;text.left+=a->scale(34);SelectObject(d->hDC,a->font);textDraw(d->hDC,COLOR_NAMES[i],text,TEXT);if(d->itemState&ODS_CHECKED)textDraw(d->hDC,L"\u2713",d->rcItem,ACCENT,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);return TRUE;}drawButton(*d);return TRUE;}
@@ -392,7 +481,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
     case WM_CTLCOLOREDIT: SetTextColor(reinterpret_cast<HDC>(wParam),TEXT);SetBkColor(reinterpret_cast<HDC>(wParam),PANEL);return reinterpret_cast<LRESULT>(a->panelBrush);
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: SetTextColor(reinterpret_cast<HDC>(wParam),TEXT);SetBkColor(reinterpret_cast<HDC>(wParam),BG);return reinterpret_cast<LRESULT>(a->bgBrush);
     case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);paint(*a,dc);EndPaint(hwnd,&ps);return 0;}
+    case WM_PAINT: {PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);bufferedPaint(dc,ps.rcPaint,[&](HDC memory){paint(*a,memory);});EndPaint(hwnd,&ps);return 0;}
     case WM_PRINTCLIENT: paint(*a,reinterpret_cast<HDC>(wParam));return 0;
     case WM_SCAN: {
         std::unique_ptr<ScanMessage> result(reinterpret_cast<ScanMessage*>(lParam));if(result->generation!=a->generation)return 0;a->loading=false;
@@ -430,7 +519,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wParam,LPARAM lParam) 
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&common);
+    if(FAILED(OleInitialize(nullptr)))return 1;INITCOMMONCONTROLSEX common{sizeof(common),ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES|ICC_STANDARD_CLASSES};InitCommonControlsEx(&common);
     App application;app=&application;
     int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);std::wstring startupFolder;
     if(argv&&argc>=3&&std::wstring(argv[1])==L"--smoke-test-data") {application.smokeTest=true;application.store=MetadataStore(std::filesystem::path(argv[2]));if(argc>=4)startupFolder=argv[3];}
@@ -443,7 +532,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     HMONITOR monitor=MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST);MONITORINFO info{sizeof(info)};GetMonitorInfoW(monitor,&info);int width=std::min(r.right-r.left,info.rcWork.right-info.rcWork.left),height=std::min(r.bottom-r.top,info.rcWork.bottom-info.rcWork.top);
     int x=std::clamp(static_cast<int>(r.left),static_cast<int>(info.rcWork.left),static_cast<int>(info.rcWork.right)-width),y=std::clamp(static_cast<int>(r.top),static_cast<int>(info.rcWork.top),static_cast<int>(info.rcWork.bottom)-height);
     HWND window=CreateWindowExW(0,wc.lpszClassName,L"Abser",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,x,y,width,height,nullptr,nullptr,instance,nullptr);
-    if(!window){CoUninitialize();return 1;}
+    if(!window){OleUninitialize();return 1;}
     // An optional command-line folder opens directly without changing audio files.
     if(!startupFolder.empty())application.load(startupFolder);
     ShowWindow(window,show);UpdateWindow(window);SetFocus(application.list);
@@ -467,5 +556,5 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         if(!IsDialogMessageW(window,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}
     }
     if(application.rowImages)ImageList_Destroy(application.rowImages);if(application.font)DeleteObject(application.font);if(application.smallFont)DeleteObject(application.smallFont);if(application.bgBrush)DeleteObject(application.bgBrush);if(application.panelBrush)DeleteObject(application.panelBrush);
-    CoUninitialize();return static_cast<int>(msg.wParam);
+    OleUninitialize();return static_cast<int>(msg.wParam);
 }

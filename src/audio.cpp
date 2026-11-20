@@ -10,10 +10,16 @@
 #include <cstring>
 #include <cstdint>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#endif
 
 #define STB_VORBIS_HEADER_ONLY
 #include "../third_party/stb_vorbis.c"
@@ -50,15 +56,18 @@ ma_encoding_format encoding(const std::wstring& path) {
 
 bool isAiff(const std::wstring& path);
 ma_decoding_backend_vtable** aiffBackends();
+#ifdef _WIN32
+ma_vfs* sharedReadVfs();
+#endif
 
 ma_result openDecoder(const std::wstring& path, ma_decoder_config config, ma_decoder* decoder) {
     config.encodingFormat = encoding(path);
     if (isAiff(path)) { config.ppCustomBackendVTables = aiffBackends(); config.customBackendCount = 1; }
 #ifdef _WIN32
-    // stb_vorbis has no wide-path file initializer. VFS opens the Unicode
-    // Windows path once, then supplies reads to its streaming decoder.
-    if (config.encodingFormat == ma_encoding_format_vorbis) return ma_decoder_init_vfs_w(nullptr, path.c_str(), &config, decoder);
-    return ma_decoder_init_file_w(path.c_str(), &config, decoder);
+    if (isAiff(path)) return ma_decoder_init_file_w(path.c_str(), &config, decoder);
+    // All stock decoders share Unicode Windows I/O with FILE_SHARE_DELETE.
+    // This also supplies the wide-path support absent from stb_vorbis itself.
+    return ma_decoder_init_vfs_w(sharedReadVfs(), path.c_str(), &config, decoder);
 #else
     return ma_decoder_init_file(std::filesystem::path(path).string().c_str(), &config, decoder);
 #endif
@@ -66,11 +75,68 @@ ma_result openDecoder(const std::wstring& path, ma_decoder_config config, ma_dec
 
 FILE* openFile(const std::wstring& path) {
 #ifdef _WIN32
-    return _wfopen(path.c_str(), L"rb");
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return nullptr;
+    const int descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_RDONLY | _O_BINARY);
+    if (descriptor < 0) { CloseHandle(handle); return nullptr; }
+    FILE* file = _fdopen(descriptor, "rb");
+    if (!file) _close(descriptor);
+    return file;
 #else
     return std::fopen(std::filesystem::path(path).string().c_str(), "rb");
 #endif
 }
+
+#ifdef _WIN32
+// Built-in decoder handles must permit Explorer/DAW moves while a file plays.
+// A separate handle is still opened for each decoder and metadata operation.
+ma_result sharedOpenW(ma_vfs*, const wchar_t* path, ma_uint32 mode, ma_vfs_file* file) {
+    if (!file || !(mode & MA_OPEN_MODE_READ) || (mode & MA_OPEN_MODE_WRITE)) return MA_INVALID_ARGS;
+    FILE* stream = openFile(path);
+    if (!stream) return MA_DOES_NOT_EXIST;
+    *file = stream;
+    return MA_SUCCESS;
+}
+ma_result sharedOpen(ma_vfs* vfs, const char* path, ma_uint32 mode, ma_vfs_file* file) {
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (count <= 0) return MA_INVALID_ARGS;
+    std::vector<wchar_t> wide(static_cast<size_t>(count));
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide.data(), count)) return MA_INVALID_ARGS;
+    return sharedOpenW(vfs, wide.data(), mode, file);
+}
+ma_result sharedClose(ma_vfs*, ma_vfs_file file) { return std::fclose(static_cast<FILE*>(file)) == 0 ? MA_SUCCESS : MA_IO_ERROR; }
+ma_result sharedRead(ma_vfs*, ma_vfs_file file, void* output, size_t bytes, size_t* received) {
+    FILE* stream = static_cast<FILE*>(file);
+    const size_t count = std::fread(output, 1, bytes, stream);
+    if (received) *received = count;
+    if (std::ferror(stream)) return MA_IO_ERROR;
+    // Vorbis's push decoder consumes partial reads only when they succeed.
+    // Report EOF on the following zero-byte read, like miniaudio's default VFS.
+    return count || !bytes ? MA_SUCCESS : MA_AT_END;
+}
+ma_result sharedSeek(ma_vfs*, ma_vfs_file file, ma_int64 offset, ma_seek_origin origin) {
+    const int whence = origin == ma_seek_origin_start ? SEEK_SET : origin == ma_seek_origin_current ? SEEK_CUR : SEEK_END;
+    return _fseeki64(static_cast<FILE*>(file), offset, whence) == 0 ? MA_SUCCESS : MA_BAD_SEEK;
+}
+ma_result sharedTell(ma_vfs*, ma_vfs_file file, ma_int64* cursor) {
+    if (!cursor) return MA_INVALID_ARGS;
+    const auto position = _ftelli64(static_cast<FILE*>(file));
+    if (position < 0) return MA_IO_ERROR;
+    *cursor = position;
+    return MA_SUCCESS;
+}
+ma_result sharedInfo(ma_vfs*, ma_vfs_file file, ma_file_info* info) {
+    if (!info) return MA_INVALID_ARGS;
+    struct _stat64 status{};
+    if (_fstat64(_fileno(static_cast<FILE*>(file)), &status) != 0) return MA_IO_ERROR;
+    info->sizeInBytes = static_cast<ma_uint64>(status.st_size);
+    return MA_SUCCESS;
+}
+ma_vfs* sharedReadVfs() {
+    static ma_vfs_callbacks callbacks{sharedOpen, sharedOpenW, sharedClose, sharedRead, nullptr, sharedSeek, sharedTell, sharedInfo};
+    return &callbacks;
+}
+#endif
 
 // AIFF's uncompressed PCM and AIFC's PCM/IEEE float forms. Chunks are skipped
 // with seeks; opening a multi-gigabyte file does not read its sample data.
@@ -243,7 +309,17 @@ ma_result initAiff(FILE* file, ma_data_source** backend) {
     *backend = decoder.release();
     return MA_SUCCESS;
 }
-ma_result aiffInitFile(void*, const char* path, const ma_decoding_backend_config*, const ma_allocation_callbacks*, ma_data_source** backend) { return initAiff(std::fopen(path, "rb"), backend); }
+ma_result aiffInitFile(void*, const char* path, const ma_decoding_backend_config*, const ma_allocation_callbacks*, ma_data_source** backend) {
+#ifdef _WIN32
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (count <= 0) return MA_INVALID_ARGS;
+    std::vector<wchar_t> wide(static_cast<size_t>(count));
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide.data(), count)) return MA_INVALID_ARGS;
+    return initAiff(openFile(wide.data()), backend);
+#else
+    return initAiff(std::fopen(path, "rb"), backend);
+#endif
+}
 ma_result aiffInitFileW(void*, const wchar_t* path, const ma_decoding_backend_config*, const ma_allocation_callbacks*, ma_data_source** backend) { return initAiff(openFile(path), backend); }
 void aiffUninit(void*, ma_data_source* backend, const ma_allocation_callbacks*) { auto* decoder = static_cast<AiffDecoder*>(backend); ma_data_source_uninit(&decoder->base); delete decoder; }
 ma_decoding_backend_vtable kAiffBackend{nullptr, aiffInitFile, aiffInitFileW, nullptr, aiffUninit};
@@ -259,6 +335,115 @@ double cheapDecoderDuration(ma_decoder& decoder, ma_encoding_format format) {
     ma_uint64 frames = 0;
     if (ma_decoder_get_length_in_pcm_frames(&decoder, &frames) != MA_SUCCESS || frames == 0 || !decoder.outputSampleRate) return -1.0;
     return static_cast<double>(frames) / decoder.outputSampleRate;
+}
+
+constexpr size_t kWaveformBins = 512;
+constexpr size_t kWaveformWorkBins = 2048;
+constexpr ma_uint64 kWaveformDecodeFrames = 4096;
+
+struct DecoderScope {
+    ma_decoder decoder{};
+    bool open = false;
+    ~DecoderScope() { if (open) ma_decoder_uninit(&decoder); }
+};
+
+// Equal-width peak bins compact pairwise as a stream grows. This bounds memory
+// even when the file has no duration metadata, without dropping brief impulses.
+struct WaveformPeaks {
+    std::array<float, kWaveformWorkBins> bins{};
+    size_t count = 0;
+    uint64_t width = 1;
+    uint64_t partialFrames = 0;
+    uint64_t frames = 0;
+    float partialPeak = 0;
+
+    void add(float peak) {
+        if (count == bins.size()) {
+            for (size_t bin = 0; bin < bins.size() / 2; ++bin) bins[bin] = std::max(bins[bin * 2], bins[bin * 2 + 1]);
+            count /= 2;
+            width *= 2;
+        }
+        partialPeak = std::max(partialPeak, peak);
+        ++frames;
+        if (++partialFrames == width) {
+            bins[count++] = partialPeak;
+            partialFrames = 0;
+            partialPeak = 0;
+        }
+    }
+
+    std::vector<float> finish() const {
+        if (!frames) return {};
+        std::vector<float> result(kWaveformBins, 0);
+        const size_t available = count + (partialFrames ? 1 : 0);
+        for (size_t bin = 0; bin < available; ++bin) {
+            const uint64_t start = static_cast<uint64_t>(bin) * width;
+            const uint64_t end = std::min<uint64_t>(start + width, frames);
+            const size_t first = std::min<size_t>(kWaveformBins - 1, static_cast<size_t>(static_cast<long double>(start) * kWaveformBins / frames));
+            const size_t last = std::min<size_t>(kWaveformBins - 1, static_cast<size_t>(std::ceil(static_cast<long double>(end) * kWaveformBins / frames) - 1));
+            const float peak = bin < count ? bins[bin] : partialPeak;
+            for (size_t target = first; target <= last; ++target) result[target] = std::max(result[target], peak);
+        }
+        return result;
+    }
+};
+
+struct WaveformFileStamp {
+    std::wstring path;
+    uintmax_t size = 0;
+    std::filesystem::file_time_type modified{};
+    bool valid = false;
+    bool operator==(const WaveformFileStamp& other) const {
+        return valid && other.valid && path == other.path && size == other.size && modified == other.modified;
+    }
+};
+
+WaveformFileStamp waveformStamp(const std::wstring& path) {
+    WaveformFileStamp result;
+    result.path = path;
+    std::error_code error;
+    result.size = std::filesystem::file_size(std::filesystem::path(path), error);
+    if (error) return result;
+    result.modified = std::filesystem::last_write_time(std::filesystem::path(path), error);
+    result.valid = !error;
+    return result;
+}
+
+template<class IsCancelled>
+WaveformSnapshot scanWaveform(const std::wstring& path, IsCancelled isCancelled) {
+    WaveformSnapshot result;
+    result.path = path;
+    if (isCancelled()) return result;
+    DecoderScope source;
+    const auto config = ma_decoder_config_init(ma_format_f32, 0, 0);
+    if (openDecoder(path, config, &source.decoder) != MA_SUCCESS) return result;
+    source.open = true;
+    if (isCancelled() || !source.decoder.outputChannels || !source.decoder.outputSampleRate) return result;
+    const auto channels = source.decoder.outputChannels;
+    // Keep the original sample rate and every channel. Downmixing or resampling
+    // before measuring peaks would hide opposite-phase audio and short hits.
+    std::vector<float> decoded(static_cast<size_t>(kWaveformDecodeFrames) * channels);
+    WaveformPeaks peaks;
+    while (!isCancelled()) {
+        ma_uint64 count = 0;
+        const auto readResult = ma_decoder_read_pcm_frames(&source.decoder, decoded.data(), kWaveformDecodeFrames, &count);
+        if (isCancelled()) return result;
+        for (ma_uint64 frame = 0; frame < count; ++frame) {
+            float peak = 0;
+            for (ma_uint32 channel = 0; channel < channels; ++channel) {
+                const float sample = decoded[static_cast<size_t>(frame) * channels + channel];
+                if (std::isfinite(sample)) peak = std::max(peak, std::min(1.0f, std::abs(sample)));
+            }
+            peaks.add(peak);
+        }
+        if (readResult == MA_AT_END || (readResult == MA_SUCCESS && count == 0)) {
+            result.peaks = peaks.finish();
+            result.durationSeconds = static_cast<double>(peaks.frames) / source.decoder.outputSampleRate;
+            return result;
+        }
+        if (readResult != MA_SUCCESS) return result;
+    }
+    return result;
 }
 
 struct Stream {
@@ -282,6 +467,8 @@ struct AudioEngine::Impl {
     std::atomic<bool> paused{false};
     std::atomic<float> volume{0.8f};
     std::atomic<uint64_t> requested{0};
+    std::atomic<uint64_t> firstBufferSerial{0};
+    std::atomic<uint64_t> failedPlaybackSerial{0};
 
     // The audio callback never takes a mutex, opens a file, or runs a decoder.
     // A hazard pointer lets the worker retire old rings without blocking audio.
@@ -298,6 +485,14 @@ struct AudioEngine::Impl {
     std::wstring pendingPath;
     std::thread worker;
 
+    // Independent from all playback locks, I/O, decoders, and callback buffers.
+    mutable std::mutex waveformMutex;
+    std::condition_variable waveformWake;
+    WaveformSnapshot waveform;
+    uint64_t waveformSerial = 0;
+    std::chrono::steady_clock::time_point waveformRequestedAt;
+    std::thread waveformWorker;
+
     void signal() {
         std::function<void()> callback;
         { std::lock_guard<std::mutex> lock(stateMutex); callback = notify; }
@@ -312,7 +507,89 @@ struct AudioEngine::Impl {
             state.error = error;
             if (duration != -2.0) state.durationSeconds = duration;
         }
+        if (newState == AudioState::Error) {
+            failedPlaybackSerial.store(serial);
+            waveformWake.notify_one();
+        }
         signal();
+    }
+
+    void scheduleWaveform(uint64_t serial, const std::wstring& path) {
+        {
+            std::lock_guard<std::mutex> lock(waveformMutex);
+            if (requested.load() != serial) return;
+            waveformSerial = serial;
+            waveformRequestedAt = std::chrono::steady_clock::now();
+            waveform = {path, {}, -1.0, !path.empty()};
+        }
+        waveformWake.notify_one();
+    }
+
+    void publishWaveform(uint64_t serial, WaveformSnapshot result) {
+        const double decodedDuration = result.durationSeconds;
+        {
+            std::lock_guard<std::mutex> lock(waveformMutex);
+            if (quitting.load() || requested.load() != serial || waveformSerial != serial) return;
+            waveform = std::move(result);
+        }
+        if (decodedDuration > 0) {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            if (requested.load() == serial && state.durationSeconds < 0) state.durationSeconds = decodedDuration;
+        }
+        signal();
+    }
+
+    void runWaveforms() {
+#ifdef _WIN32
+        // Windows background mode also lowers I/O priority. Playback retains
+        // its normal worker priority and the output device's realtime callback.
+        if (!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+        struct CacheEntry { WaveformFileStamp stamp; WaveformSnapshot result; };
+        std::deque<CacheEntry> cache;
+        uint64_t handledSerial = 0;
+        while (!quitting.load()) {
+            uint64_t serial;
+            std::wstring path;
+            {
+                std::unique_lock<std::mutex> lock(waveformMutex);
+                waveformWake.wait(lock, [&] { return quitting.load() || waveformSerial != handledSerial; });
+                if (quitting.load()) break;
+                serial = waveformSerial;
+                path = waveform.path;
+                if (path.empty()) { handledSerial = serial; continue; }
+                const auto due = waveformRequestedAt + std::chrono::milliseconds(120);
+                if (waveformWake.wait_until(lock, due, [&] { return quitting.load() || waveformSerial != serial; })) continue;
+                // Playback publishes this gate without taking waveformMutex.
+                // A bounded wait also covers a notification arriving just before
+                // the condition variable sleeps, without coupling audio locks.
+                while (!quitting.load() && waveformSerial == serial && requested.load() == serial && firstBufferSerial.load() != serial && failedPlaybackSerial.load() != serial) waveformWake.wait_for(lock, std::chrono::milliseconds(20));
+                if (quitting.load()) break;
+                if (waveformSerial != serial) continue;
+                handledSerial = serial;
+                if (requested.load() != serial) continue;
+            }
+            const auto cancelled = [&] { return quitting.load() || requested.load() != serial; };
+            if (failedPlaybackSerial.load() == serial) { publishWaveform(serial, {path, {}, -1.0, false}); continue; }
+            if (cancelled()) continue;
+            const auto stamp = waveformStamp(path);
+            if (cancelled()) continue;
+            const auto cached = std::find_if(cache.begin(), cache.end(), [&](const CacheEntry& item) { return item.stamp == stamp; });
+            if (cached != cache.end()) {
+                CacheEntry hit = std::move(*cached);
+                cache.erase(cached);
+                publishWaveform(serial, hit.result);
+                cache.push_front(std::move(hit));
+                continue;
+            }
+            auto result = scanWaveform(path, cancelled);
+            if (cancelled()) continue;
+            if (!result.peaks.empty() && stamp.valid) {
+                cache.push_front({stamp, result});
+                if (cache.size() > 8) cache.pop_back();
+            }
+            publishWaveform(serial, std::move(result));
+        }
     }
 
     void retireCurrent(Stream* replacement) {
@@ -410,7 +687,14 @@ struct AudioEngine::Impl {
                         active->samples[offset + 1] = decoded[frame * 2 + 1];
                     }
                     active->write.store(write + count, std::memory_order_release);
-                    if (result == MA_AT_END || (result == MA_SUCCESS && count == 0)) active->eof.store(true, std::memory_order_release);
+                    if (count && firstBufferSerial.load() != activeSerial) {
+                        firstBufferSerial.store(activeSerial);
+                        waveformWake.notify_one();
+                    }
+                    if (result == MA_AT_END || (result == MA_SUCCESS && count == 0)) {
+                        active->eof.store(true, std::memory_order_release);
+                        if (!write && !count) { failedPlaybackSerial.store(activeSerial); waveformWake.notify_one(); }
+                    }
                     else if (result != MA_SUCCESS) {
                         retireCurrent(nullptr);
                         active = nullptr;
@@ -477,6 +761,7 @@ bool AudioEngine::initialize(bool silentTestDevice) {
     self.quitting.store(false);
     self.initialized.store(true);
     self.worker = std::thread([&self] { self.run(); });
+    self.waveformWorker = std::thread([&self] { self.runWaveforms(); });
     return true;
 }
 
@@ -488,8 +773,15 @@ void AudioEngine::shutdown() {
         self.pendingPath.clear();
         self.requested.fetch_add(1);
     }
+    {
+        std::lock_guard<std::mutex> lock(self.waveformMutex);
+        self.waveformSerial = self.requested.load();
+        self.waveform = {};
+    }
     self.wake.notify_all();
+    self.waveformWake.notify_all();
     if (self.worker.joinable()) self.worker.join();
+    if (self.waveformWorker.joinable()) self.waveformWorker.join();
     if (self.deviceReady) { ma_device_uninit(&self.device); self.deviceReady = false; }
     if (self.contextReady) { ma_context_uninit(&self.context); self.contextReady = false; }
     self.callbackHazard.store(nullptr);
@@ -505,15 +797,17 @@ void AudioEngine::setNotify(std::function<void()> notify) {
 void AudioEngine::play(const std::wstring& path) {
     auto& self = *impl_;
     if (!self.initialized.load()) return;
+    uint64_t serial;
     {
         std::lock_guard<std::mutex> lock(self.requestMutex);
         self.pendingPath = path;
-        self.requested.fetch_add(1); // Silences the previous ring on the next device block.
+        serial = self.requested.fetch_add(1) + 1; // Silences the previous ring on the next device block.
         self.paused.store(false);
         std::lock_guard<std::mutex> stateLock(self.stateMutex);
         self.state = {path, L"", AudioState::Loading, -1.0, 0.0};
     }
     self.wake.notify_one();
+    self.scheduleWaveform(serial, path);
     self.signal();
 }
 
@@ -530,10 +824,11 @@ void AudioEngine::togglePause() {
 
 void AudioEngine::stop() {
     auto& self = *impl_;
+    uint64_t serial;
     {
         std::lock_guard<std::mutex> lock(self.requestMutex);
         self.pendingPath.clear();
-        self.requested.fetch_add(1);
+        serial = self.requested.fetch_add(1) + 1;
         self.paused.store(false);
         std::lock_guard<std::mutex> stateLock(self.stateMutex);
         self.state.state = AudioState::Stopped;
@@ -541,6 +836,7 @@ void AudioEngine::stop() {
         self.state.positionSeconds = 0;
     }
     self.wake.notify_one();
+    self.scheduleWaveform(serial, L"");
     self.signal();
 }
 
@@ -559,6 +855,11 @@ AudioSnapshot AudioEngine::snapshot() const {
     return result;
 }
 
+WaveformSnapshot AudioEngine::waveformSnapshot() const {
+    std::lock_guard<std::mutex> lock(impl_->waveformMutex);
+    return impl_->waveform;
+}
+
 double probeDuration(const std::wstring& path) {
     const auto format = encoding(path);
     if (format == ma_encoding_format_unknown && !isAiff(path)) return -1.0;
@@ -567,7 +868,7 @@ double probeDuration(const std::wstring& path) {
         if (!file) return -1.0;
         int error = 0;
         auto* vorbis = stb_vorbis_open_file(file, 1, &error, nullptr);
-        if (!vorbis) { std::fclose(file); return -1.0; }
+        if (!vorbis) return -1.0; // stb_vorbis owns/closes file even when initialization fails.
         const double result = stb_vorbis_stream_length_in_seconds(vorbis);
         stb_vorbis_close(vorbis);
         return result > 0 ? result : -1.0;

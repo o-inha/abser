@@ -16,7 +16,10 @@ Supported audio: WAV/WAVE, AIFF/AIFC (PCM and floating point), MP3, FLAC, and Og
 - Click a file's **Cat** cell to choose one of ten colours or clear its category.
 - The colour checkboxes above the list control which categories appear. Unassigned files have their own filter.
 - Click a column heading to sort; click it again to reverse. Drag column dividers to resize. Scroll horizontally to reach columns beyond the current window width.
-- Adjust playback volume with the slider at the bottom.
+- Use the slim horizontal and vertical scrollbar thumbs to move around the list. Mouse-wheel scrolling is animated; arrow-key auditioning responds immediately.
+- The waveform and playback cursor appear above the transport controls. Waveform previews load in the background while audio plays.
+- Click anywhere on the volume slider to jump to that level, or drag it to adjust playback volume.
+- Drag an audio file from the list to Explorer or a DAW. Windows negotiates the drag operation with the destination, including copy, move, and link where supported.
 
 Shortcuts: **Ctrl+L** focuses the path, **Ctrl+O** opens the folder chooser, **F5** refreshes the directory, **C** opens the selected file's category picker, and **Escape** stops playback while the list has focus. You can also drop a folder or audio file onto the window to open its directory.
 
