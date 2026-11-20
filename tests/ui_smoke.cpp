@@ -257,9 +257,11 @@ void testFileDrag(Process& process, HWND list, const std::filesystem::path& expe
     require(WindowFromPoint(drop) == sink.window, "File-drop target is covered by another native window");
     std::cout << "Native drag source=" << source.x << ',' << source.y << " target=" << drop.x << ',' << drop.y << '\n';
     focusControl(process.window, list);
-    // A completed filename click restarts the fixture before the drag, keeping
-    // the decoder's real file handle open while the MOVE target completes.
+    // Retain the rapid-click gesture, then stop so the following held press
+    // must itself start playback before its button-up or any drag movement.
     clickScreen(source); pumpFor(80);
+    key(list, VK_ESCAPE);
+    waitAudioState(process, 1, "Could not stop audio before testing a held filename press");
     moveScreen(source); mouseButton(MOUSEEVENTF_LEFTDOWN);
     try {
         // A held click must already play; only crossing the drag threshold pauses.
